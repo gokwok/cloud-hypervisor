@@ -68,6 +68,7 @@ vhost = { version = "0.16.0", default-features = false }
 vhost-user-backend = { version = "0.22.0", default-features = false }
 virtio-bindings = "0.2.6"
 virtio-queue = "0.17.0"
+virtiofsd = { version = "=1.14.0", default-features = false }
 vm-fdt = "0.3.0"
 vm-memory = "0.17.1"
 vmm-sys-util = "0.15.0"
