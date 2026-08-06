@@ -640,7 +640,7 @@ fn pty_foreground_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
 fn vmm_thread_rules(
     hypervisor_type: HypervisorType,
 ) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
-    Ok(vec![
+    let mut rules = vec![
         (libc::SYS_accept4, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_access, vec![]),
@@ -714,7 +714,6 @@ fn vmm_thread_rules(
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_open, vec![]),
         (libc::SYS_openat, vec![]),
-        (libc::SYS_openat2, vec![]),
         (libc::SYS_pipe2, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_poll, vec![]),
@@ -778,7 +777,9 @@ fn vmm_thread_rules(
         (libc::SYS_userfaultfd, vec![]),
         (libc::SYS_wait4, vec![]),
         (libc::SYS_writev, vec![]),
-    ])
+    ];
+    rules.extend(virtio_devices::seccomp_filters::virtio_fs_thread_rules());
+    Ok(rules)
 }
 
 #[cfg(feature = "kvm")]

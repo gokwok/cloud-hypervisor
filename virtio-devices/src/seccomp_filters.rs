@@ -231,7 +231,7 @@ fn virtio_vhost_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     ]
 }
 
-fn virtio_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+pub fn virtio_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     vec![
         (libc::SYS_capget, vec![]),
         (libc::SYS_capset, vec![]),
