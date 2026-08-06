@@ -219,6 +219,10 @@ pub enum DeviceManagerError {
     #[error("Cannot create virtio-fs device")]
     CreateVirtioFs(#[source] vhost_user::Error),
 
+    /// Cannot create native virtio-fs device
+    #[error("Cannot create native virtio-fs device")]
+    CreateNativeVirtioFs(#[source] io::Error),
+
     /// Virtio-fs device was created without a socket.
     #[error("Virtio-fs device was created without a socket")]
     NoVirtioFsSock,
@@ -3312,7 +3316,36 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
-        if let Some(fs_socket) = fs_cfg.socket.to_str() {
+        if let Some(native) = &fs_cfg.native {
+            let virtio_fs_device = Arc::new(Mutex::new(
+                virtio_devices::Fs::new(
+                    id.clone(),
+                    &fs_cfg.tag,
+                    fs_cfg.num_queues,
+                    fs_cfg.queue_size,
+                    native,
+                    self.seccomp_action.clone(),
+                    self.exit_evt
+                        .try_clone()
+                        .map_err(DeviceManagerError::EventFd)?,
+                    self.force_access_platform,
+                    state_from_id(snapshot, id.as_str())
+                        .map_err(DeviceManagerError::RestoreGetState)?,
+                )
+                .map_err(DeviceManagerError::CreateNativeVirtioFs)?,
+            ));
+
+            node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
+            self.device_tree.lock().unwrap().insert(id, node);
+
+            return Ok(MetaVirtioDevice {
+                virtio_device: virtio_fs_device as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+                pci_common: fs_cfg.pci_common.clone(),
+                dma_handler: None,
+            });
+        }
+
+        if let Some(fs_socket) = fs_cfg.socket.as_ref().and_then(|socket| socket.to_str()) {
             let virtio_fs_device = Arc::new(Mutex::new(
                 vhost_user::Fs::new(
                     id.clone(),

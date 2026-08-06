@@ -3,16 +3,17 @@
 In the context of virtualization, it is always convenient to be able to share a
 directory from the host with the guest.
 
-__virtio-fs__, also known as __vhost-user-fs__ is a virtual device defined by
-the VIRTIO specification which allows any VMM to perform filesystem sharing.
+__virtio-fs__ is a virtual device defined by the VIRTIO specification which
+allows any VMM to perform filesystem sharing. Cloud Hypervisor supports an
+external vhost-user backend and an in-process native backend.
 
 ## Pre-requisites
 
 ### The daemon
 
-This virtual device relies on the _vhost-user_ protocol, which assumes the
-backend (device emulation) is handled by a dedicated process running on the
-host. This daemon is called __virtiofsd__ and needs to be present on the host.
+The external backend relies on the _vhost-user_ protocol and a dedicated
+__virtiofsd__ process on the host. Skip this section when using the native
+backend.
 
 _Build virtiofsd_
 ```bash
@@ -64,8 +65,8 @@ to be used.
 Both direct kernel boot and EFI firmware can be used to boot a VM with
 virtio-fs, given that the cloud image contains a recent enough kernel.
 
-Correct functioning of `--fs` requires `--memory shared=on` to facilitate
-interprocess memory sharing.
+The external backend requires `--memory shared=on` to facilitate interprocess
+memory sharing. The native backend does not.
 
 Assuming you have `focal-server-cloudimg-amd64.raw` and `vmlinux` on your
 system, here is the Cloud Hypervisor command you need to run:
@@ -78,6 +79,31 @@ system, here is the Cloud Hypervisor command you need to run:
     --cmdline "console=hvc0 root=/dev/vda1 rw" \
     --fs tag=myfs,socket=/tmp/virtiofs,num_queues=1,queue_size=512
 ```
+
+To run the backend inside Cloud Hypervisor instead, pass the shared directory
+directly:
+
+```bash
+./cloud-hypervisor \
+    --cpus boot=1 \
+    --memory size=1G \
+    --disk path=focal-server-cloudimg-amd64.raw \
+    --kernel vmlinux \
+    --cmdline "console=hvc0 root=/dev/vda1 rw" \
+    --fs tag=myfs,shared_dir=/tmp/shared_dir,cache=never,num_queues=1,queue_size=512
+```
+
+The native backend also accepts `cache=auto|always|never`, `readonly=on|off`,
+`xattr=on|off`, and `announce_submounts=on|off`. It uses the official
+`virtiofsd` passthrough implementation in-process, eliminating the daemon,
+vhost-user socket, and restore handshake. The shared directory is therefore
+inside Cloud Hypervisor's security boundary; use Landlock or an equivalent
+outer sandbox when isolation from the VMM process is required.
+
+Snapshots retain their selected backend. A native snapshot contains native
+filesystem state and must be restored with `shared_dir` paths, while an
+external snapshot continues to require its vhost-user sockets. Converting an
+existing snapshot between the two backends is not supported.
 
 ### Mount the shared directory
 

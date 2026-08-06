@@ -25,7 +25,9 @@ use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 use virtio_bindings::virtio_ids::*;
 use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
-use virtio_devices::{RateLimiterConfig, TokenBucketConfig, net, vhost_user};
+use virtio_devices::{
+    NativeFsCache, NativeFsConfig, RateLimiterConfig, TokenBucketConfig, net, vhost_user,
+};
 
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
@@ -53,6 +55,12 @@ pub enum Error {
     /// Filesystem socket is missing
     #[error("Error parsing --fs: socket missing")]
     ParseFsSockMissing,
+    /// Filesystem specifies both external and native backends
+    #[error("Error parsing --fs: socket and shared_dir are mutually exclusive")]
+    ParseFsBackendConflict,
+    /// Filesystem native cache policy is invalid
+    #[error("Error parsing --fs: invalid native cache policy {0}")]
+    ParseFsCacheInvalid(String),
     /// Generic vhost-user device type is invalid
     #[error(
         "Error parsing --generic-vhost-user: device_type {0:?} invalid (leading zeros or unknown string)"
@@ -343,6 +351,9 @@ pub enum ValidationError {
     /// Placing the device behind a virtual IOMMU is not supported
     #[error("Device does not support being placed behind IOMMU")]
     IommuNotSupported,
+    /// Virtio-fs must select one backend
+    #[error("Virtio-fs must specify exactly one of socket or native")]
+    InvalidFsBackend,
     /// Duplicated device path (device added twice)
     #[error("Duplicated device path: {0}")]
     DuplicateDevicePath(String),
@@ -2130,7 +2141,9 @@ impl GenericVhostUserConfig {
 
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
-    \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
+    \"tag=<tag_name>,socket=<socket_path>|shared_dir=<native_shared_path>,\
+    cache=auto|always|never,readonly=on|off,xattr=on|off,announce_submounts=on|off,\
+    num_queues=<number_of_queues>,\
     queue_size=<size_of_each_queue>,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
@@ -2141,6 +2154,11 @@ impl FsConfig {
             .add("queue_size")
             .add("num_queues")
             .add("socket")
+            .add("shared_dir")
+            .add("cache")
+            .add("readonly")
+            .add("xattr")
+            .add("announce_submounts")
             .add_all(PciDeviceCommonConfig::OPTIONS);
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
@@ -2148,7 +2166,43 @@ impl FsConfig {
         if tag.len() > vhost_user::VIRTIO_FS_TAG_LEN {
             return Err(Error::ParseFsTagTooLong);
         }
-        let socket = PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?);
+        let socket = parser.get("socket").map(PathBuf::from);
+        let shared_dir = parser.get("shared_dir").map(PathBuf::from);
+        if socket.is_none() && shared_dir.is_none() {
+            return Err(Error::ParseFsSockMissing);
+        }
+        if socket.is_some() && shared_dir.is_some() {
+            return Err(Error::ParseFsBackendConflict);
+        }
+        let native = shared_dir
+            .map(|shared_dir| {
+                let cache = match parser.get("cache").as_deref().unwrap_or("never") {
+                    "auto" => NativeFsCache::Auto,
+                    "always" => NativeFsCache::Always,
+                    "never" => NativeFsCache::Never,
+                    value => return Err(Error::ParseFsCacheInvalid(value.to_owned())),
+                };
+                Ok(NativeFsConfig {
+                    shared_dir,
+                    cache,
+                    read_only: parser
+                        .convert::<Toggle>("readonly")
+                        .map_err(Error::ParseFileSystem)?
+                        .unwrap_or(Toggle(false))
+                        .0,
+                    xattr: parser
+                        .convert::<Toggle>("xattr")
+                        .map_err(Error::ParseFileSystem)?
+                        .unwrap_or(Toggle(false))
+                        .0,
+                    announce_submounts: parser
+                        .convert::<Toggle>("announce_submounts")
+                        .map_err(Error::ParseFileSystem)?
+                        .unwrap_or(Toggle(false))
+                        .0,
+                })
+            })
+            .transpose()?;
 
         let queue_size = parser
             .convert("queue_size")
@@ -2165,12 +2219,16 @@ impl FsConfig {
             pci_common,
             tag,
             socket,
+            native,
             num_queues,
             queue_size,
         })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if self.socket.is_some() == self.native.is_some() {
+            return Err(ValidationError::InvalidFsBackend);
+        }
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
@@ -4572,7 +4630,8 @@ mod unit_tests {
     fn fs_fixture() -> FsConfig {
         FsConfig {
             pci_common: PciDeviceCommonConfig::default(),
-            socket: PathBuf::from("/tmp/sock"),
+            socket: Some(PathBuf::from("/tmp/sock")),
+            native: None,
             tag: "mytag".to_owned(),
             num_queues: 1,
             queue_size: 1024,
@@ -4586,6 +4645,19 @@ mod unit_tests {
         FsConfig::parse("tag=mytag").unwrap_err();
         FsConfig::parse("socket=/tmp/sock").unwrap_err();
         assert_eq!(FsConfig::parse("tag=mytag,socket=/tmp/sock")?, fs_fixture());
+        assert_eq!(
+            FsConfig::parse("tag=mytag,shared_dir=/tmp/shared,cache=always,announce_submounts=on")?,
+            FsConfig {
+                socket: None,
+                native: Some(NativeFsConfig {
+                    shared_dir: PathBuf::from("/tmp/shared"),
+                    cache: NativeFsCache::Always,
+                    announce_submounts: true,
+                    ..Default::default()
+                }),
+                ..fs_fixture()
+            }
+        );
         assert_eq!(
             FsConfig::parse("tag=mytag,socket=/tmp/sock,num_queues=4,queue_size=1024")?,
             FsConfig {

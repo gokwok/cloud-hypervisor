@@ -18,7 +18,7 @@ use log::{debug, warn};
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use virtio_devices::RateLimiterConfig;
+use virtio_devices::{NativeFsConfig, RateLimiterConfig};
 
 use crate::Landlock;
 use crate::landlock::LandlockError;
@@ -580,7 +580,10 @@ pub struct FsConfig {
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
     pub tag: String,
-    pub socket: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeFsConfig>,
     #[serde(default = "default_fsconfig_num_queues")]
     pub num_queues: usize,
     #[serde(default = "default_fsconfig_queue_size")]
@@ -597,7 +600,13 @@ pub fn default_fsconfig_queue_size() -> u16 {
 
 impl ApplyLandlock for FsConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        landlock.add_rule_with_access(&self.socket, "rw")?;
+        if let Some(socket) = &self.socket {
+            landlock.add_rule_with_access(socket, "rw")?;
+        }
+        if let Some(native) = &self.native {
+            let access = if native.read_only { "r" } else { "rw" };
+            landlock.add_rule_with_access(&native.shared_dir, access)?;
+        }
         Ok(())
     }
 }
