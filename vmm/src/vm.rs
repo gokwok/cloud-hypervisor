@@ -1378,7 +1378,6 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
-        ondemand_prefault_rate_mib: Option<u64>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1436,7 +1435,6 @@ impl Vm {
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode.unwrap_or_default(),
-                    ondemand_prefault_rate_mib,
                     phys_bits,
                     &exit_evt,
                 )

@@ -1498,10 +1498,6 @@ components:
           type: boolean
         memory_restore_mode:
           $ref: "#/components/schemas/MemoryRestoreMode"
-        ondemand_prefault_rate_mib:
-          type: integer
-          format: uint64
-          description: Per-VM background prefault rate in MiB/s; zero disables background prefault.
         resume:
           type: boolean
 
