@@ -93,6 +93,7 @@ const MPOL_MF_MOVE: u32 = 1 << 1;
 const PLATFORM_DEVICE_AREA_SIZE: u64 = 1 << 20;
 
 const MAX_PREFAULT_THREAD_COUNT: usize = 16;
+const UFFD_PREFAULT_WINDOW: time::Duration = time::Duration::from_millis(10);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct HotPlugState {
@@ -930,6 +931,7 @@ impl MemoryManager {
         &mut self,
         file_path: &Path,
         saved_regions: &MemoryRangeTable,
+        prefault_rate_mib: Option<u64>,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
         let mut file_offset: u64 = 0;
@@ -943,7 +945,7 @@ impl MemoryManager {
         };
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(snapshot_file));
-        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
+        self.spawn_uffd_handler(uffd_fd, None, ranges, source, prefault_rate_mib, exit_evt)?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -969,7 +971,7 @@ impl MemoryManager {
             .map_err(UffdError::SetSocket)?;
         let source: Box<dyn UffdMemorySource> =
             Box::new(SocketUffdMemorySource::new(socket, shared_backing));
-        self.spawn_uffd_handler(uffd_fd, Some(socket_fd), ranges, source, exit_evt)
+        self.spawn_uffd_handler(uffd_fd, Some(socket_fd), ranges, source, None, exit_evt)
     }
 
     /// Create a UFFD fd and register every range.
@@ -1058,6 +1060,7 @@ impl MemoryManager {
         fault_socket_fd: Option<OwnedFd>,
         handler_ranges: Vec<UffdRange>,
         source: Box<dyn UffdMemorySource>,
+        prefault_rate_mib: Option<u64>,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
         info!(
@@ -1082,6 +1085,7 @@ impl MemoryManager {
                         thread_stop_event,
                         source,
                         &handler_ranges,
+                        prefault_rate_mib,
                         &ready_tx,
                         &thread_prefault_complete,
                     );
@@ -1167,6 +1171,7 @@ impl MemoryManager {
         stop_event: EventFd,
         mut source: Box<dyn UffdMemorySource>,
         ranges: &[UffdRange],
+        prefault_rate_mib: Option<u64>,
         ready_tx: &SyncSender<()>,
         prefault_complete: &AtomicBool,
     ) -> Result<(), io::Error> {
@@ -1189,11 +1194,31 @@ impl MemoryManager {
             })
             .collect();
 
-        // Prefault cursor: (range index, page index within range). `None`
-        // means prefault was given up due to an error (natural completion
-        // returns from the function instead).
-        let mut prefault_cursor: Option<(usize, u64)> = (!ranges.is_empty()).then_some((0, 0));
+        // A configured zero rate keeps the UFFD handler demand-only. Other
+        // rates use a short fixed window so epoll can still wake immediately
+        // for guest page faults while background prefault is paced.
+        let max_page_size = ranges
+            .iter()
+            .map(|range| range.page_size)
+            .max()
+            .unwrap_or(0);
+        let prefault_bytes_per_window = prefault_rate_mib
+            .filter(|rate| *rate > 0)
+            .map(|rate| rate.saturating_mul(1 << 20) / 100);
+        let mut prefault_budget = prefault_bytes_per_window.unwrap_or(0);
+        let prefault_budget_capacity = prefault_bytes_per_window
+            .map(|budget| budget.saturating_add(max_page_size))
+            .unwrap_or(0);
+        let mut next_prefault_window = time::Instant::now() + UFFD_PREFAULT_WINDOW;
+        let mut prefault_cursor: Option<(usize, u64)> =
+            (prefault_rate_mib != Some(0) && !ranges.is_empty()).then_some((0, 0));
         let prefault_start = time::Instant::now();
+
+        match prefault_rate_mib {
+            Some(0) => info!("UFFD restore: background prefault disabled"),
+            Some(rate) => info!("UFFD restore: background prefault limited to {rate} MiB/s"),
+            None => info!("UFFD restore: background prefault unlimited"),
+        }
 
         const EVENT_STOP: u64 = 0;
         const EVENT_UFFD: u64 = 1;
@@ -1222,9 +1247,31 @@ impl MemoryManager {
 
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
         loop {
-            // Block only when prefault is done; otherwise poll non-blocking
-            // so we can advance prefault between faults.
-            let timeout = if prefault_cursor.is_some() { 0 } else { -1 };
+            if let Some(window_budget) = prefault_bytes_per_window {
+                let now = time::Instant::now();
+                if now >= next_prefault_window {
+                    prefault_budget = prefault_budget
+                        .saturating_add(window_budget)
+                        .min(prefault_budget_capacity);
+                    next_prefault_window = now + UFFD_PREFAULT_WINDOW;
+                }
+            }
+
+            // A paced wait remains interruptible by UFFD events, so demand
+            // faults take priority over background prefault.
+            let timeout = match prefault_cursor {
+                None => -1,
+                Some((range_idx, _))
+                    if prefault_bytes_per_window.is_some()
+                        && prefault_budget < ranges[range_idx].page_size =>
+                {
+                    next_prefault_window
+                        .saturating_duration_since(time::Instant::now())
+                        .as_millis()
+                        .max(1) as i32
+                }
+                Some(_) => 0,
+            };
             let num_events = match epoll::wait(epoll_fd, timeout, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1301,6 +1348,15 @@ impl MemoryManager {
                             FaultResolution::Served => {
                                 pages_served += 1;
                                 served_bitmap[range_idx].set_bit(page_idx as usize);
+                                if prefault_rate_mib == Some(0) && pages_served == total_pages {
+                                    info!(
+                                        "UFFD handler: all pages served on demand — \
+                                         prefaulted={pages_prefaulted} served={pages_served} \
+                                         total={total_pages}"
+                                    );
+                                    prefault_complete.store(true, Ordering::Release);
+                                    return Ok(());
+                                }
                                 break;
                             }
                             FaultResolution::Retry => {
@@ -1359,10 +1415,14 @@ impl MemoryManager {
             };
 
             let range = &ranges[range_idx];
+            if prefault_bytes_per_window.is_some() && prefault_budget < range.page_size {
+                continue;
+            }
 
             let advance = match source.resolve(uffd_fd.as_fd(), range, page_idx) {
                 Ok(FaultResolution::Served) => {
                     pages_prefaulted += 1;
+                    prefault_budget = prefault_budget.saturating_sub(range.page_size);
                     served_bitmap[range_idx].set_bit(page_idx as usize);
                     true
                 }
@@ -1884,6 +1944,7 @@ impl MemoryManager {
         source_url: Option<&str>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        ondemand_prefault_rate_mib: Option<u64>,
         phys_bits: u8,
         exit_evt: &EventFd,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -1909,6 +1970,7 @@ impl MemoryManager {
                 mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
                     &mem_snapshot.memory_ranges,
+                    ondemand_prefault_rate_mib,
                     exit_evt,
                 )?;
             } else {

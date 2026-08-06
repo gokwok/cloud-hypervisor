@@ -117,14 +117,27 @@ If `memory_restore_mode` is omitted, Cloud Hypervisor uses the eager-copy
 restore path (`copy`).
 
 With `memory_restore_mode=ondemand`, restore uses `userfaultfd` to fault snapshot
-pages in on first access instead of copying the full `memory-ranges` file into
-guest RAM before restore completes. This mode is strict: if Cloud Hypervisor
-cannot enable the `userfaultfd` restore path, restore fails instead of falling
-back to `copy`.
+pages in on first access. While idle, the fault handler also populates the
+remaining pages in the background. Set `ondemand_prefault_rate_mib=0` to disable
+that background work, or a positive per-VM MiB/s value to limit it. Omitting the
+option preserves unlimited background prefault. This mode is strict: if Cloud
+Hypervisor cannot enable the `userfaultfd` restore path, restore fails instead
+of falling back to `copy`.
+
+```bash
+./cloud-hypervisor \
+    --api-socket /tmp/cloud-hypervisor.sock \
+    --restore source_url=file:///home/foo/snapshot,memory_restore_mode=ondemand,ondemand_prefault_rate_mib=64
+```
+
+Disabling background prefault keeps snapshot and migration blocked because
+guest memory may still depend on the source snapshot. A positive limit
+eventually populates all guest memory and removes that restriction.
 
 Current constraints for `memory_restore_mode=ondemand`:
 
 - `prefault=on` is not supported
+- `ondemand_prefault_rate_mib` is only valid for on-demand restore
 - the snapshot memory ranges must be page-aligned
 
 ## Restore a VM with new Net FDs

@@ -393,6 +393,10 @@ pub enum ValidationError {
     /// Prefault cannot be combined with on-demand restore
     #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
     InvalidRestorePrefaultWithOnDemand,
+
+    /// On-demand prefault rate used with copy restore.
+    #[error("'ondemand_prefault_rate_mib' requires 'memory_restore_mode=ondemand'")]
+    InvalidOnDemandPrefaultRate,
     /// Path provided in landlock-rules doesn't exist
     #[error("Path {0:?} provided in landlock-rules does not exist")]
     LandlockPathDoesNotExist(PathBuf),
@@ -2810,6 +2814,8 @@ pub struct RestoreConfig {
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
     #[serde(default)]
+    pub ondemand_prefault_rate_mib: Option<u64>,
+    #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
     #[serde(default)]
     pub resume: bool,
@@ -2817,11 +2823,12 @@ pub struct RestoreConfig {
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,ondemand_prefault_rate_mib=<MiB/s>,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
+        \n`ondemand_prefault_rate_mib` limits background prefault per VM; 0 disables it and omission preserves unlimited prefault \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n `resume` controls whether the VM will be directly resumed after restore ";
@@ -2832,6 +2839,7 @@ impl RestoreConfig {
             .add("source_url")
             .add("prefault")
             .add("memory_restore_mode")
+            .add("ondemand_prefault_rate_mib")
             .add("net_fds")
             .add("resume");
         parser.parse(restore).map_err(Error::ParseRestore)?;
@@ -2849,6 +2857,9 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
+        let ondemand_prefault_rate_mib = parser
+            .convert::<u64>("ondemand_prefault_rate_mib")
+            .map_err(Error::ParseRestore)?;
         let net_fds = parser
             .convert::<Tuple<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
@@ -2871,6 +2882,7 @@ impl RestoreConfig {
             source_url,
             prefault,
             memory_restore_mode,
+            ondemand_prefault_rate_mib,
             net_fds,
             resume,
         })
@@ -2882,6 +2894,11 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
+        }
+        if self.memory_restore_mode != MemoryRestoreMode::OnDemand
+            && self.ondemand_prefault_rate_mib.is_some()
+        {
+            return Err(ValidationError::InvalidOnDemandPrefaultRate);
         }
 
         let mut restored_net_with_fds = HashMap::new();
@@ -5089,6 +5106,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                ondemand_prefault_rate_mib: None,
                 net_fds: None,
                 resume: false,
             }
@@ -5101,6 +5119,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                ondemand_prefault_rate_mib: None,
                 net_fds: Some(vec![
                     RestoredNetConfig {
                         id: "net0".to_string(),
@@ -5117,11 +5136,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }
         );
         assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
+            RestoreConfig::parse(
+                "source_url=/path/to/snapshot,memory_restore_mode=ondemand,ondemand_prefault_rate_mib=64",
+            )?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
+                ondemand_prefault_rate_mib: Some(64),
                 net_fds: None,
                 resume: false,
             }
@@ -5132,6 +5154,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
+                ondemand_prefault_rate_mib: None,
                 net_fds: None,
                 resume: true,
             }
@@ -5233,6 +5256,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
+            ondemand_prefault_rate_mib: None,
             net_fds: Some(vec![
                 RestoredNetConfig {
                     id: "net0".to_string(),
@@ -5309,6 +5333,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
+            ondemand_prefault_rate_mib: None,
             net_fds: None,
             resume: false,
         };
@@ -5326,6 +5351,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
+            ondemand_prefault_rate_mib: None,
             net_fds: None,
             resume: false,
         };
