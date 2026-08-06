@@ -1952,21 +1952,27 @@ impl MemoryManager {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
             memory_file_path.push(String::from(SNAPSHOT_FILENAME));
 
-            let mem_snapshot: MemoryManagerSnapshotData =
-                snapshot.to_state().map_err(Error::Restore)?;
+            let mem_snapshot: MemoryManagerSnapshotData = {
+                trace_scoped!("restore.memory.decode_state");
+                snapshot.to_state().map_err(Error::Restore)?
+            };
 
-            let mm = MemoryManager::new(
-                vm,
-                config,
-                Some(prefault),
-                phys_bits,
-                #[cfg(feature = "tdx")]
-                false,
-                Some(&mem_snapshot),
-                Default::default(),
-            )?;
+            let mm = {
+                trace_scoped!("restore.memory.create_regions");
+                MemoryManager::new(
+                    vm,
+                    config,
+                    Some(prefault),
+                    phys_bits,
+                    #[cfg(feature = "tdx")]
+                    false,
+                    Some(&mem_snapshot),
+                    Default::default(),
+                )?
+            };
 
             if memory_restore_mode == MemoryRestoreMode::OnDemand {
+                trace_scoped!("restore.memory.register_uffd");
                 mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
                     &mem_snapshot.memory_ranges,
@@ -1974,6 +1980,7 @@ impl MemoryManager {
                     exit_evt,
                 )?;
             } else {
+                trace_scoped!("restore.memory.copy");
                 mm.lock()
                     .unwrap()
                     .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;

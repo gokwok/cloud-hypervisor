@@ -14,4 +14,8 @@ macro_rules! trace_point {
 }
 
 pub fn end() {}
+pub struct TraceGuard;
+pub fn start_scoped() -> TraceGuard {
+    TraceGuard
+}
 pub fn start() {}

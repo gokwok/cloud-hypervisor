@@ -180,6 +180,19 @@ pub fn end() {
     unsafe { TRACER.get().unwrap().end() }
 }
 
+pub struct TraceGuard;
+
+impl Drop for TraceGuard {
+    fn drop(&mut self) {
+        end();
+    }
+}
+
+pub fn start_scoped() -> TraceGuard {
+    start();
+    TraceGuard
+}
+
 pub fn start() {
     // SAFETY: this is called before other threads start
     unsafe { TRACER.set(Tracer::new()).unwrap() }

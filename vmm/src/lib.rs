@@ -1910,7 +1910,12 @@ impl Vmm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
-                let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
+                let _trace = tracer::start_scoped();
+                trace_scoped!("restore.total");
+                let snapshot = {
+                    trace_scoped!("restore.receive_state");
+                    recv_vm_state(source_url).map_err(VmError::Restore)?
+                };
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
 
@@ -1921,8 +1926,10 @@ impl Vmm {
                 self.vm_config = Some(Arc::clone(&vm_config));
 
                 // Always re-populate the 'console_info' based on the new 'vm_config'
-                self.console_info =
-                    Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+                self.console_info = Some({
+                    trace_scoped!("restore.pre_create_console");
+                    pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?
+                });
 
                 let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
                 let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
@@ -1940,25 +1947,28 @@ impl Vmm {
                     .try_clone()
                     .map_err(VmError::EventFdClone)?;
 
-                let mut vm = Vm::new(
-                    vm_config,
-                    exit_evt,
-                    reset_evt,
-                    guest_exit_evt,
-                    #[cfg(feature = "guest_debug")]
-                    debug_evt,
-                    &self.seccomp_action,
-                    self.hypervisor.clone(),
-                    activate_evt,
-                    self.console_info.clone(),
-                    self.console_resize_pipe.clone(),
-                    Arc::clone(&self.original_termios_opt),
-                    Some(&snapshot),
-                    Some(source_url),
-                    Some(prefault),
-                    Some(memory_restore_mode),
-                    ondemand_prefault_rate_mib,
-                )?;
+                let mut vm = {
+                    trace_scoped!("restore.vm_new");
+                    Vm::new(
+                        vm_config,
+                        exit_evt,
+                        reset_evt,
+                        guest_exit_evt,
+                        #[cfg(feature = "guest_debug")]
+                        debug_evt,
+                        &self.seccomp_action,
+                        self.hypervisor.clone(),
+                        activate_evt,
+                        self.console_info.clone(),
+                        self.console_resize_pipe.clone(),
+                        Arc::clone(&self.original_termios_opt),
+                        Some(&snapshot),
+                        Some(source_url),
+                        Some(prefault),
+                        Some(memory_restore_mode),
+                        ondemand_prefault_rate_mib,
+                    )?
+                };
 
                 if self
                     .vm_config
@@ -1974,7 +1984,10 @@ impl Vmm {
 
                 // Now we can restore the rest of the VM.
                 // PANIC: won't panic, we just checked that the VM is there.
-                vm.restore()?;
+                {
+                    trace_scoped!("restore.start_vcpus");
+                    vm.restore()?;
+                }
                 self.vm = VmOwnership::Owned(vm);
                 Ok(())
             }

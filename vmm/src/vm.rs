@@ -626,59 +626,68 @@ impl Vm {
         });
 
         // Create CPU manager
-        let cpu_manager = Self::create_cpu_manager(
-            &config,
-            vm.clone(),
-            exit_evt.try_clone().map_err(Error::EventFdClone)?,
-            reset_evt.try_clone().map_err(Error::EventFdClone)?,
-            #[cfg(feature = "guest_debug")]
-            vm_debug_evt,
-            &hypervisor,
-            seccomp_action.clone(),
-            vm_ops,
-            &numa_nodes,
-        )?;
+        let cpu_manager = {
+            trace_scoped!("restore.cpu_manager");
+            Self::create_cpu_manager(
+                &config,
+                vm.clone(),
+                exit_evt.try_clone().map_err(Error::EventFdClone)?,
+                reset_evt.try_clone().map_err(Error::EventFdClone)?,
+                #[cfg(feature = "guest_debug")]
+                vm_debug_evt,
+                &hypervisor,
+                seccomp_action.clone(),
+                vm_ops,
+                &numa_nodes,
+            )?
+        };
 
         // Perform hypervisor-specific TDX initialization if enabled
         #[cfg(feature = "tdx")]
         Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
 
         // Create device manager
-        let device_manager = Self::create_device_manager(
-            io_bus,
-            mmio_bus,
-            vm.clone(),
-            config.clone(),
-            memory_manager.clone(),
-            cpu_manager.clone(),
-            exit_evt.try_clone().map_err(Error::EventFdClone)?,
-            reset_evt,
-            guest_exit_evt,
-            seccomp_action.clone(),
-            numa_nodes.clone(),
-            &activate_evt,
-            force_access_platform,
-            boot_id_list,
-            #[cfg(not(target_arch = "riscv64"))]
-            timestamp,
-            snapshot,
-        )?;
+        let device_manager = {
+            trace_scoped!("restore.device_manager");
+            Self::create_device_manager(
+                io_bus,
+                mmio_bus,
+                vm.clone(),
+                config.clone(),
+                memory_manager.clone(),
+                cpu_manager.clone(),
+                exit_evt.try_clone().map_err(Error::EventFdClone)?,
+                reset_evt,
+                guest_exit_evt,
+                seccomp_action.clone(),
+                numa_nodes.clone(),
+                &activate_evt,
+                force_access_platform,
+                boot_id_list,
+                #[cfg(not(target_arch = "riscv64"))]
+                timestamp,
+                snapshot,
+            )?
+        };
 
         // Perform hypervisor-specific initialization
-        let load_payload_handle = Self::hypervisor_specific_init(
-            &vm,
-            &memory_manager,
-            &cpu_manager,
-            &device_manager,
-            &config,
-            &hypervisor,
-            console_info.as_ref(),
-            console_resize_pipe.as_ref(),
-            &original_termios,
-            snapshot,
-            #[cfg(feature = "igvm")]
-            igvm_file,
-        )?;
+        let load_payload_handle = {
+            trace_scoped!("restore.hypervisor_init");
+            Self::hypervisor_specific_init(
+                &vm,
+                &memory_manager,
+                &cpu_manager,
+                &device_manager,
+                &config,
+                &hypervisor,
+                console_info.as_ref(),
+                console_resize_pipe.as_ref(),
+                &original_termios,
+                snapshot,
+                #[cfg(feature = "igvm")]
+                igvm_file,
+            )?
+        };
 
         // Load kernel and initramfs files
         #[cfg(feature = "tdx")]
@@ -1126,25 +1135,34 @@ impl Vm {
         // For KVM, create interrupt controller after boot vcpus
         // because GIC state is restored from snapshot during vcpu creation
         let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
-        let ic = device_manager
-            .lock()
-            .unwrap()
-            .create_interrupt_controller(dm_snapshot)
-            .map_err(Error::DeviceManager)?;
+        let ic = {
+            trace_scoped!("restore.kvm.interrupt_controller");
+            device_manager
+                .lock()
+                .unwrap()
+                .create_interrupt_controller(dm_snapshot)
+                .map_err(Error::DeviceManager)?
+        };
 
-        vm.init().map_err(Error::InitializeVm)?;
+        {
+            trace_scoped!("restore.kvm.vm_init");
+            vm.init().map_err(Error::InitializeVm)?;
+        }
 
-        device_manager
-            .lock()
-            .unwrap()
-            .create_devices(
-                console_info,
-                console_resize_pipe,
-                original_termios,
-                ic,
-                dm_snapshot,
-            )
-            .map_err(Error::DeviceManager)?;
+        {
+            trace_scoped!("restore.kvm.devices");
+            device_manager
+                .lock()
+                .unwrap()
+                .create_devices(
+                    console_info,
+                    console_resize_pipe,
+                    original_termios,
+                    ic,
+                    dm_snapshot,
+                )
+                .map_err(Error::DeviceManager)?;
+        }
 
         Ok(())
     }
@@ -1387,6 +1405,7 @@ impl Vm {
         };
 
         let vm = {
+            trace_scoped!("restore.create_hypervisor_vm");
             #[allow(unused_mut)]
             let mut hv_config: hypervisor::HypervisorVmConfig =
                 vm_config.as_ref().lock().unwrap().deref().into();
@@ -1409,6 +1428,7 @@ impl Vm {
 
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
+                trace_scoped!("restore.memory_manager");
                 MemoryManager::new_from_snapshot(
                     snapshot,
                     vm.clone(),
@@ -1435,27 +1455,30 @@ impl Vm {
                 .map_err(Error::MemoryManager)?
             };
 
-        Vm::new_from_memory_manager(
-            vm_config,
-            memory_manager,
-            vm,
-            exit_evt,
-            reset_evt,
-            guest_exit_evt,
-            #[cfg(feature = "guest_debug")]
-            vm_debug_evt,
-            seccomp_action,
-            hypervisor,
-            activate_evt,
-            #[cfg(not(target_arch = "riscv64"))]
-            timestamp,
-            console_info,
-            console_resize_pipe,
-            original_termios,
-            snapshot,
-            #[cfg(feature = "igvm")]
-            igvm_file,
-        )
+        {
+            trace_scoped!("restore.vm_components");
+            Vm::new_from_memory_manager(
+                vm_config,
+                memory_manager,
+                vm,
+                exit_evt,
+                reset_evt,
+                guest_exit_evt,
+                #[cfg(feature = "guest_debug")]
+                vm_debug_evt,
+                seccomp_action,
+                hypervisor,
+                activate_evt,
+                #[cfg(not(target_arch = "riscv64"))]
+                timestamp,
+                console_info,
+                console_resize_pipe,
+                original_termios,
+                snapshot,
+                #[cfg(feature = "igvm")]
+                igvm_file,
+            )
+        }
     }
 
     pub fn create_hypervisor_vm(

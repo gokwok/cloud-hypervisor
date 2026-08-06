@@ -1534,7 +1534,10 @@ impl DeviceManager {
         )?;
 
         #[cfg(target_arch = "aarch64")]
-        self.add_legacy_devices(legacy_interrupt_manager.as_ref(), snapshot)?;
+        {
+            trace_scoped!("restore.devices.legacy");
+            self.add_legacy_devices(legacy_interrupt_manager.as_ref(), snapshot)?;
+        }
 
         {
             self.ged_notification_device = self.add_acpi_devices(
@@ -1565,8 +1568,14 @@ impl DeviceManager {
         }
         self.legacy_interrupt_manager = Some(legacy_interrupt_manager);
 
-        self.make_virtio_devices(snapshot)?;
-        self.add_pci_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio");
+            self.make_virtio_devices(snapshot)?;
+        }
+        {
+            trace_scoped!("restore.devices.pci");
+            self.add_pci_devices(snapshot)?;
+        }
 
         // Add pvmemcontrol if required
         #[cfg(feature = "pvmemcontrol")]
