@@ -2649,35 +2649,71 @@ impl DeviceManager {
 
     fn make_virtio_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
         // Create "standard" virtio devices (net/block/rng)
-        self.make_virtio_block_devices(snapshot)?;
-        self.make_virtio_net_devices(snapshot)?;
-        self.make_virtio_rng_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.block");
+            self.make_virtio_block_devices(snapshot)?;
+        }
+        {
+            trace_scoped!("restore.devices.virtio.net");
+            self.make_virtio_net_devices(snapshot)?;
+        }
+        {
+            trace_scoped!("restore.devices.virtio.rng");
+            self.make_virtio_rng_devices(snapshot)?;
+        }
 
         // Add generic vhost-user if required
-        self.make_generic_vhost_user_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.vhost_user");
+            self.make_generic_vhost_user_devices(snapshot)?;
+        }
 
         // Add virtio-fs if required
-        self.make_virtio_fs_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.fs");
+            self.make_virtio_fs_devices(snapshot)?;
+        }
 
         // Add virtio-pmem if required
-        self.make_virtio_pmem_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.pmem");
+            self.make_virtio_pmem_devices(snapshot)?;
+        }
 
         // Add virtio-vsock if required
-        self.make_virtio_vsock_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.vsock");
+            self.make_virtio_vsock_devices(snapshot)?;
+        }
 
-        self.make_virtio_mem_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.mem");
+            self.make_virtio_mem_devices(snapshot)?;
+        }
 
         // Add virtio-balloon if required
-        self.make_virtio_balloon_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.balloon");
+            self.make_virtio_balloon_devices(snapshot)?;
+        }
 
         // Add virtio-watchdog device
-        self.make_virtio_watchdog_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.watchdog");
+            self.make_virtio_watchdog_devices(snapshot)?;
+        }
 
         // Add vDPA devices if required
-        self.make_vdpa_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.vdpa");
+            self.make_vdpa_devices(snapshot)?;
+        }
 
         // Add virtio-rtc device
-        self.make_virtio_rtc_devices(snapshot)?;
+        {
+            trace_scoped!("restore.devices.virtio.rtc");
+            self.make_virtio_rtc_devices(snapshot)?;
+        }
 
         Ok(())
     }
