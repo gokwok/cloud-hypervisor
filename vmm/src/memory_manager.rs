@@ -6,7 +6,7 @@
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, metadata};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{MaybeUninit, zeroed};
 use std::num::NonZeroUsize;
@@ -78,6 +78,69 @@ pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
 
 const SNAPSHOT_FILENAME: &str = "memory-ranges";
+
+struct MmapRestoreSource<'a> {
+    path: &'a Path,
+    ranges: &'a MemoryRangeTable,
+    page_size: u64,
+}
+
+impl<'a> MmapRestoreSource<'a> {
+    fn new(path: &'a Path, ranges: &'a MemoryRangeTable) -> Result<Self, Error> {
+        // SAFETY: FFI call with a constant argument.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return Err(Error::SnapshotPageSize(io::Error::last_os_error()));
+        }
+        let page_size = page_size as u64;
+        let expected_len = ranges.regions().iter().try_fold(0u64, |offset, range| {
+            if range.gpa % page_size != 0
+                || range.length % page_size != 0
+                || offset % page_size != 0
+            {
+                return Err(Error::MmapRestoreRangeMisaligned {
+                    gpa: range.gpa,
+                    length: range.length,
+                    offset,
+                });
+            }
+            offset
+                .checked_add(range.length)
+                .ok_or(Error::MmapRestoreFileTooLarge)
+        })?;
+        let actual_len = metadata(path).map_err(Error::SnapshotOpen)?.len();
+        if actual_len != expected_len {
+            return Err(Error::MmapRestoreFileSize {
+                actual: actual_len,
+                expected: expected_len,
+            });
+        }
+
+        Ok(Self {
+            path,
+            ranges,
+            page_size,
+        })
+    }
+
+    fn file_offset_for(&self, mapping: &GuestRamMapping) -> Result<u64, Error> {
+        let mut offset = 0u64;
+        for range in self.ranges.regions() {
+            if range.gpa == mapping.gpa && range.length == mapping.size {
+                debug_assert_eq!(offset % self.page_size, 0);
+                return Ok(offset);
+            }
+            offset = offset
+                .checked_add(range.length)
+                .ok_or(Error::MmapRestoreFileTooLarge)?;
+        }
+
+        Err(Error::MmapRestoreRangeMissing {
+            gpa: mapping.gpa,
+            length: mapping.size,
+        })
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_IRQ_BASE: u32 = 5;
@@ -390,6 +453,30 @@ pub enum Error {
     /// Error reading from snapshot file
     #[error("Error reading from snapshot file")]
     SnapshotRead(#[source] io::Error),
+
+    /// Failed to obtain the host page size for an mmap restore
+    #[error("Failed to obtain the host page size for an mmap restore")]
+    SnapshotPageSize(#[source] io::Error),
+
+    /// The mmap restore snapshot file has an unexpected size
+    #[error("Mmap restore snapshot file has size {actual}, expected {expected}")]
+    MmapRestoreFileSize { actual: u64, expected: u64 },
+
+    /// The mmap restore snapshot file is too large
+    #[error("Mmap restore snapshot file is too large")]
+    MmapRestoreFileTooLarge,
+
+    /// An mmap restore range is not page-aligned
+    #[error(
+        "Mmap restore range at GPA {gpa:#x} with length {length:#x} and file offset {offset:#x} is not page-aligned"
+    )]
+    MmapRestoreRangeMisaligned { gpa: u64, length: u64, offset: u64 },
+
+    /// A guest RAM mapping has no complete mmap restore range
+    #[error(
+        "Guest RAM mapping at GPA {gpa:#x} with length {length:#x} has no complete mmap restore range"
+    )]
+    MmapRestoreRangeMissing { gpa: u64, length: u64 },
 
     // Error copying snapshot into region
     #[error("Error copying snapshot into region")]
@@ -762,6 +849,7 @@ impl MemoryManager {
         zones_config: &[MemoryZoneConfig],
         prefault: Option<bool>,
         mut existing_memory_files: HashMap<u32, File>,
+        mmap_restore_source: Option<&MmapRestoreSource<'_>>,
         thp: bool,
     ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
         let mut memory_regions = Vec::new();
@@ -783,13 +871,24 @@ impl MemoryManager {
         for guest_ram_mapping in guest_ram_mappings {
             for zone_config in zones_config {
                 if guest_ram_mapping.zone_id == zone_config.id {
+                    let (backing_file, file_offset) = if let Some(source) = mmap_restore_source {
+                        (
+                            Some(source.path.to_path_buf()),
+                            source.file_offset_for(guest_ram_mapping)?,
+                        )
+                    } else {
+                        (
+                            if guest_ram_mapping.virtio_mem {
+                                None
+                            } else {
+                                zone_config.file.clone()
+                            },
+                            guest_ram_mapping.file_offset,
+                        )
+                    };
                     let region = MemoryManager::create_ram_region(
-                        if guest_ram_mapping.virtio_mem {
-                            &None
-                        } else {
-                            &zone_config.file
-                        },
-                        guest_ram_mapping.file_offset,
+                        &backing_file,
+                        file_offset,
                         GuestAddress(guest_ram_mapping.gpa),
                         guest_ram_mapping.size as usize,
                         prefault.unwrap_or(zone_config.prefault),
@@ -1630,6 +1729,29 @@ impl MemoryManager {
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
+        Self::new_internal(
+            vm,
+            config,
+            prefault,
+            phys_bits,
+            #[cfg(feature = "tdx")]
+            tdx_enabled,
+            restore_data,
+            existing_memory_files,
+            None,
+        )
+    }
+
+    fn new_internal(
+        vm: Arc<dyn hypervisor::Vm>,
+        config: &MemoryConfig,
+        prefault: Option<bool>,
+        phys_bits: u8,
+        #[cfg(feature = "tdx")] tdx_enabled: bool,
+        restore_data: Option<&MemoryManagerSnapshotData>,
+        existing_memory_files: HashMap<u32, File>,
+        mmap_restore_source: Option<&MmapRestoreSource<'_>>,
+    ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         trace_scoped!("MemoryManager::new");
 
         let user_provided_zones = config.size == 0;
@@ -1664,6 +1786,7 @@ impl MemoryManager {
                 &zones,
                 prefault,
                 existing_memory_files,
+                mmap_restore_source,
                 config.thp,
             )?;
             let guest_memory =
@@ -1896,9 +2019,18 @@ impl MemoryManager {
                 snapshot.to_state().map_err(Error::Restore)?
             };
 
+            let mmap_restore_source = if memory_restore_mode == MemoryRestoreMode::Mmap {
+                Some(MmapRestoreSource::new(
+                    &memory_file_path,
+                    &mem_snapshot.memory_ranges,
+                )?)
+            } else {
+                None
+            };
+
             let mm = {
                 trace_scoped!("restore.memory.create_regions");
-                MemoryManager::new(
+                MemoryManager::new_internal(
                     vm,
                     config,
                     Some(prefault),
@@ -1907,21 +2039,28 @@ impl MemoryManager {
                     false,
                     Some(&mem_snapshot),
                     Default::default(),
+                    mmap_restore_source.as_ref(),
                 )?
             };
 
-            if memory_restore_mode == MemoryRestoreMode::OnDemand {
-                trace_scoped!("restore.memory.register_uffd");
-                mm.lock().unwrap().restore_by_uffd(
-                    &memory_file_path,
-                    &mem_snapshot.memory_ranges,
-                    exit_evt,
-                )?;
-            } else {
-                trace_scoped!("restore.memory.copy");
-                mm.lock()
-                    .unwrap()
-                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+            match memory_restore_mode {
+                MemoryRestoreMode::Copy => {
+                    trace_scoped!("restore.memory.copy");
+                    mm.lock()
+                        .unwrap()
+                        .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+                }
+                MemoryRestoreMode::OnDemand => {
+                    trace_scoped!("restore.memory.register_uffd");
+                    mm.lock().unwrap().restore_by_uffd(
+                        &memory_file_path,
+                        &mem_snapshot.memory_ranges,
+                        exit_evt,
+                    )?;
+                }
+                MemoryRestoreMode::Mmap => {
+                    info!("Mmap restore: private file-backed guest memory enabled");
+                }
             }
 
             Ok(mm)
@@ -3396,5 +3535,86 @@ impl Migratable for MemoryManager {
             table.extend(sub_table);
         }
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+
+    fn host_page_size() -> usize {
+        // SAFETY: FFI call with a constant argument.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
+    #[test]
+    fn mmap_restore_source_uses_snapshot_range_order() {
+        let page_size = host_page_size();
+        let mut snapshot = tempfile::NamedTempFile::new().unwrap();
+        snapshot
+            .as_file_mut()
+            .set_len((page_size * 2) as u64)
+            .unwrap();
+
+        let mut ranges = MemoryRangeTable::default();
+        ranges.push(MemoryRange {
+            gpa: 0x20_000,
+            length: page_size as u64,
+        });
+        ranges.push(MemoryRange {
+            gpa: 0x10_000,
+            length: page_size as u64,
+        });
+        let source = MmapRestoreSource::new(snapshot.path(), &ranges).unwrap();
+        let mapping = GuestRamMapping {
+            slot: 0,
+            gpa: 0x10_000,
+            size: page_size as u64,
+            zone_id: DEFAULT_MEMORY_ZONE.to_owned(),
+            virtio_mem: false,
+            file_offset: 0,
+        };
+
+        assert_eq!(source.file_offset_for(&mapping).unwrap(), page_size as u64);
+    }
+
+    #[test]
+    fn mmap_restore_mapping_is_private_copy_on_write() {
+        let page_size = host_page_size();
+        let mut snapshot = tempfile::NamedTempFile::new().unwrap();
+        snapshot.write_all(&vec![0x5a; page_size]).unwrap();
+        snapshot.flush().unwrap();
+        let path = snapshot.path().to_path_buf();
+        let region = MemoryManager::create_ram_region_raw(
+            &Some(path.clone()),
+            0,
+            page_size,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(region.flags() & libc::MAP_PRIVATE, libc::MAP_PRIVATE);
+        // SAFETY: the mapping is writable and covers at least one byte.
+        unsafe {
+            assert_eq!(*region.as_ptr(), 0x5a);
+            *region.as_ptr() = 0xa5;
+            assert_eq!(*region.as_ptr(), 0xa5);
+        }
+
+        let mut persisted = [0u8; 1];
+        File::open(path)
+            .unwrap()
+            .read_exact(&mut persisted)
+            .unwrap();
+        assert_eq!(persisted[0], 0x5a);
     }
 }

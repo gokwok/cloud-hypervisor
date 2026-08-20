@@ -404,6 +404,12 @@ pub enum ValidationError {
     /// Prefault cannot be combined with on-demand restore
     #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
     InvalidRestorePrefaultWithOnDemand,
+    /// Prefault cannot be combined with mmap restore
+    #[error("'prefault' cannot be combined with 'memory_restore_mode=mmap'")]
+    InvalidRestorePrefaultWithMmap,
+    /// Mmap restore requires private guest memory
+    #[error("'memory_restore_mode=mmap' requires private guest memory")]
+    MmapRestoreRequiresPrivateMemory,
     /// Path provided in landlock-rules doesn't exist
     #[error("Path {0:?} provided in landlock-rules does not exist")]
     LandlockPathDoesNotExist(PathBuf),
@@ -2840,6 +2846,8 @@ pub enum MemoryRestoreMode {
     Copy,
     /// Restore lazily by faulting snapshot pages into guest RAM on demand.
     OnDemand,
+    /// Restore lazily from a private file mapping backed by the snapshot.
+    Mmap,
 }
 
 #[derive(Debug, Error)]
@@ -2855,6 +2863,7 @@ impl FromStr for MemoryRestoreMode {
         match s.to_lowercase().as_str() {
             "copy" => Ok(Self::Copy),
             "ondemand" => Ok(Self::OnDemand),
+            "mmap" => Ok(Self::Mmap),
             _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
         }
     }
@@ -2875,11 +2884,11 @@ pub struct RestoreConfig {
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|mmap,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
-        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
+        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables userfaultfd demand paging, and `memory_restore_mode=mmap` maps the snapshot privately for kernel demand paging and copy-on-write \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n `resume` controls whether the VM will be directly resumed after restore ";
@@ -2940,6 +2949,21 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
+        }
+        if self.memory_restore_mode == MemoryRestoreMode::Mmap && self.prefault {
+            return Err(ValidationError::InvalidRestorePrefaultWithMmap);
+        }
+        if self.memory_restore_mode == MemoryRestoreMode::Mmap
+            && (vm_config.memory.shared
+                || vm_config.memory.hugepages
+                || vm_config
+                    .memory
+                    .zones
+                    .iter()
+                    .flatten()
+                    .any(|zone| zone.shared || zone.hugepages))
+        {
+            return Err(ValidationError::MmapRestoreRequiresPrivateMemory);
         }
 
         let mut restored_net_with_fds = HashMap::new();
@@ -3287,7 +3311,7 @@ impl VmConfig {
         }
 
         if let Some(fses) = &self.fs {
-            if !fses.is_empty() && !self.backed_by_shared_memory() {
+            if fses.iter().any(|fs| fs.socket.is_some()) && !self.backed_by_shared_memory() {
                 return Err(ValidationError::VhostUserRequiresSharedMemory);
             }
             for fs in fses {
@@ -5199,6 +5223,16 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }
         );
         assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=mmap")?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode: MemoryRestoreMode::Mmap,
+                net_fds: None,
+                resume: false,
+            }
+        );
+        assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,resume=on")?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
@@ -5229,6 +5263,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             .unwrap()
             .memory_restore_mode,
             MemoryRestoreMode::OnDemand
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"Mmap"}"#
+            )
+            .unwrap()
+            .memory_restore_mode,
+            MemoryRestoreMode::Mmap
         );
     }
 
@@ -5404,6 +5446,27 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_restore_mode.validate(&snapshot_vm_config),
             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
+        );
+
+        let invalid_mmap_prefault = RestoreConfig {
+            memory_restore_mode: MemoryRestoreMode::Mmap,
+            ..invalid_restore_mode.clone()
+        };
+        assert_eq!(
+            invalid_mmap_prefault.validate(&snapshot_vm_config),
+            Err(ValidationError::InvalidRestorePrefaultWithMmap)
+        );
+
+        let mmap_restore = RestoreConfig {
+            prefault: false,
+            memory_restore_mode: MemoryRestoreMode::Mmap,
+            ..invalid_restore_mode
+        };
+        mmap_restore.validate(&snapshot_vm_config).unwrap();
+        snapshot_vm_config.memory.shared = true;
+        assert_eq!(
+            mmap_restore.validate(&snapshot_vm_config),
+            Err(ValidationError::MmapRestoreRequiresPrivateMemory)
         );
     }
 
@@ -5675,6 +5738,17 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::VhostUserRequiresSharedMemory)
         );
+
+        let mut native_fs_config = valid_config.clone();
+        native_fs_config.fs = Some(vec![FsConfig {
+            socket: None,
+            native: Some(NativeFsConfig {
+                shared_dir: PathBuf::from("/tmp/shared"),
+                ..Default::default()
+            }),
+            ..fs_fixture()
+        }]);
+        native_fs_config.validate().unwrap();
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.disks = Some(vec![DiskConfig {

@@ -122,10 +122,25 @@ guest RAM before restore completes. This mode is strict: if Cloud Hypervisor
 cannot enable the `userfaultfd` restore path, restore fails instead of falling
 back to `copy`.
 
+With `memory_restore_mode=mmap`, Cloud Hypervisor maps each complete guest RAM
+region directly from the `memory-ranges` file using `MAP_PRIVATE`. The host
+kernel loads snapshot pages when they are first accessed, and guest writes use
+copy-on-write without modifying the immutable snapshot. This avoids the
+userspace fault handler and its per-page read and copy, but it requires private
+guest memory and a snapshot containing one complete, page-aligned range for
+each guest RAM mapping.
+
 Current constraints for `memory_restore_mode=ondemand`:
 
 - `prefault=on` is not supported
 - the snapshot memory ranges must be page-aligned
+
+Current constraints for `memory_restore_mode=mmap`:
+
+- `prefault=on` is not supported
+- shared or huge page backed guest memory is not supported
+- every guest RAM mapping must have one complete snapshot range
+- the snapshot file and range offsets must be page-aligned
 
 ## Restore a VM with new Net FDs
 For a VM created with FDs explicitly passed to NetConfig, a set of valid FDs
