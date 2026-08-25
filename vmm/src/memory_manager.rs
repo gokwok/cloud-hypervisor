@@ -6,7 +6,7 @@
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions, metadata};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{MaybeUninit, zeroed};
 use std::num::NonZeroUsize;
@@ -108,7 +108,10 @@ impl<'a> MmapRestoreSource<'a> {
                 .checked_add(range.length)
                 .ok_or(Error::MmapRestoreFileTooLarge)
         })?;
-        let actual_len = metadata(path).map_err(Error::SnapshotOpen)?.len();
+        let snapshot_file = File::open(path).map_err(Error::SnapshotOpen)?;
+        let actual_len = block::query_device_size(&snapshot_file)
+            .map_err(Error::MmapRestoreSourceSize)?
+            .0;
         if actual_len != expected_len {
             return Err(Error::MmapRestoreFileSize {
                 actual: actual_len,
@@ -461,6 +464,10 @@ pub enum Error {
     /// The mmap restore snapshot file has an unexpected size
     #[error("Mmap restore snapshot file has size {actual}, expected {expected}")]
     MmapRestoreFileSize { actual: u64, expected: u64 },
+
+    /// Failed to query the mmap restore source size
+    #[error("Failed to query mmap restore source size")]
+    MmapRestoreSourceSize(#[source] io::Error),
 
     /// The mmap restore snapshot file is too large
     #[error("Mmap restore snapshot file is too large")]
