@@ -823,9 +823,9 @@ impl VsockMuxer {
                             let guest_request_unix_us = timing
                                 .guest_request_unix_us
                                 .unwrap_or(timing.command_unix_us);
-                            info!(
+                            warn!(
                                 target: "ch_timing",
-                                "event=ch_vsock_connect local_port={} peer_port={} accepted_unix_us={} command_unix_us={} guest_request_unix_us={} finished_unix_us={} accept_to_command_us={} command_to_guest_request_us={} guest_response_us={} total_us={}",
+                                "ch_timing event=ch_vsock_connect local_port={} peer_port={} accepted_unix_us={} command_unix_us={} guest_request_unix_us={} finished_unix_us={} accept_to_command_us={} command_to_guest_request_us={} guest_response_us={} total_us={}",
                                 key.local_port,
                                 key.peer_port,
                                 timing.accepted_unix_us,

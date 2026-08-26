@@ -1421,9 +1421,9 @@ impl CpuManager {
                             }
 
                             if let Some(timing) = vcpu_resume_timing.lock().unwrap().take() {
-                                info!(
+                                warn!(
                                     target: "ch_timing",
-                                    "event=ch_vcpu_first_run cpu_id={} resume_started_unix_us={} first_run_unix_us={} resume_to_first_run_us={}",
+                                    "ch_timing event=ch_vcpu_first_run cpu_id={} resume_started_unix_us={} first_run_unix_us={} resume_to_first_run_us={}",
                                     vcpu_id,
                                     timing.started_unix_us,
                                     unix_time_us(),

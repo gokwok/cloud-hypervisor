@@ -3338,9 +3338,9 @@ impl Pausable for Vm {
         // And we're back to the Running state.
         self.state = new_state;
         event!("vm", "resumed");
-        info!(
+        warn!(
             target: "ch_timing",
-            "event=ch_vm_resume started_unix_us={} finished_unix_us={} validation_us={} guest_clock_us={} hypervisor_us={} devices_us={} vcpus_us={} total_us={}",
+            "ch_timing event=ch_vm_resume started_unix_us={} finished_unix_us={} validation_us={} guest_clock_us={} hypervisor_us={} devices_us={} vcpus_us={} total_us={}",
             started_unix_us,
             unix_time_us(),
             validation_us,

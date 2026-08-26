@@ -2428,9 +2428,9 @@ impl RequestHandler for Vmm {
                 }
                 let resume_us = phase_started.elapsed().as_micros();
 
-                info!(
+                warn!(
                     target: "ch_timing",
-                    "event=ch_restore started_unix_us={} finished_unix_us={} config_read_us={} config_prepare_us={} vm_build_us={} resume_us={} total_us={}",
+                    "ch_timing event=ch_restore started_unix_us={} finished_unix_us={} config_read_us={} config_prepare_us={} vm_build_us={} resume_us={} total_us={}",
                     started_unix_us,
                     unix_time_us(),
                     config_read_us,
