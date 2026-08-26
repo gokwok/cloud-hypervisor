@@ -12,6 +12,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, RwLock};
+use std::time::{Instant, SystemTime};
 use std::{fs, io, result};
 
 use anyhow::anyhow;
@@ -46,6 +47,7 @@ use vmm_sys_util::eventfd::EventFd;
 /// - an event queue FD; and
 /// - a backend FD.
 ///
+use super::defs::uapi;
 use super::{VsockBackend, VsockPacket};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
@@ -102,6 +104,14 @@ pub struct VsockEpollHandler<B: VsockBackend> {
     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
     pub backend: Arc<RwLock<B>>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
+    pub(crate) rx_request_timing: Option<(Instant, u64)>,
+}
+
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 impl<B> VsockEpollHandler<B>
@@ -111,7 +121,7 @@ where
     /// Signal the guest driver that we've used some virtio buffers that it had previously made
     /// available.
     ///
-    fn signal_used_queue(&self, queue_index: u16) -> result::Result<(), DeviceError> {
+    fn signal_used_queue(&mut self, queue_index: u16) -> result::Result<(), DeviceError> {
         debug!("vsock: raising IRQ");
 
         self.interrupt_cb
@@ -119,7 +129,20 @@ where
             .map_err(|e| {
                 error!("Failed to signal used queue: {e:?}");
                 DeviceError::FailedSignalingUsedQueue(e)
-            })
+            })?;
+        if queue_index == 0
+            && let Some((request_committed_at, request_committed_unix_us)) =
+                self.rx_request_timing.take()
+        {
+            warn!(
+                target: "ch_timing",
+                "ch_timing event=ch_vsock_guest_kick request_committed_unix_us={} kick_unix_us={} commit_to_kick_us={}",
+                request_committed_unix_us,
+                unix_time_us(),
+                request_committed_at.elapsed().as_micros(),
+            );
+        }
+        Ok(())
     }
 
     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we
@@ -138,7 +161,12 @@ where
                 Ok(mut pkt) => {
                     if self.backend.write().unwrap().recv_pkt(&mut pkt).is_ok() {
                         match pkt.commit_hdr(desc_chain.memory()) {
-                            Ok(()) => pkt.hdr().len() as u32 + pkt.len(),
+                            Ok(()) => {
+                                if pkt.op() == uapi::VSOCK_OP_REQUEST {
+                                    self.rx_request_timing = Some((Instant::now(), unix_time_us()));
+                                }
+                                pkt.hdr().len() as u32 + pkt.len()
+                            }
                             Err(err) => {
                                 warn!(
                                     "vsock: Error writing packet header to guest memory: \
@@ -488,6 +516,7 @@ where
             interrupt_cb: interrupt_cb.clone(),
             backend: self.backend.clone(),
             access_platform: self.common.access_platform(),
+            rx_request_timing: None,
         };
 
         let paused = self.common.paused.clone();
@@ -667,7 +696,7 @@ mod unit_tests {
         // Test case: successful IRQ signaling.
         {
             let test_ctx = TestContext::new();
-            let ctx = test_ctx.create_epoll_handler_context();
+            let mut ctx = test_ctx.create_epoll_handler_context();
 
             let _queue: Queue = Queue::new(256).unwrap();
             ctx.handler.signal_used_queue(0).unwrap();

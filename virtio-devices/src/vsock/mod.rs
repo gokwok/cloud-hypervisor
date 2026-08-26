@@ -343,6 +343,7 @@ pub mod unit_tests {
                     interrupt_cb,
                     backend: Arc::new(RwLock::new(TestBackend::new())),
                     access_platform: None,
+                    rx_request_timing: None,
                 },
             }
         }
