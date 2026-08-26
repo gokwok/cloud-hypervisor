@@ -114,8 +114,6 @@ pub mod riscv64;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_X86_DEFAULT_VM;
-#[cfg(feature = "tdx")]
-use kvm_bindings::KVM_X86_SW_PROTECTED_VM;
 ///
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
 ///
@@ -142,18 +140,20 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, KVM_REG_RISCV_TIMER, kvm_riscv_core};
+#[cfg(feature = "tdx")]
+use kvm_bindings::{KVM_X86_SW_PROTECTED_VM, KVMIO};
 #[cfg(target_arch = "x86_64")]
-use kvm_bindings::{KVMIO, Xsave as xsave2, kvm_pre_fault_memory, kvm_xsave2};
+use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
 pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
 use log::error;
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
+#[cfg(target_arch = "x86_64")]
+use vmm_sys_util::ioctl::ioctl_with_ref;
+#[cfg(target_arch = "x86_64")]
+use vmm_sys_util::{fam::FamStruct, ioctl_io_nr, ioctl_iow_nr};
 #[cfg(feature = "tdx")]
-use vmm_sys_util::ioctl::ioctl_with_val;
-#[cfg(target_arch = "x86_64")]
-use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
-#[cfg(target_arch = "x86_64")]
-use vmm_sys_util::{fam::FamStruct, ioctl_io_nr, ioctl_iow_nr, ioctl_iowr_nr};
+use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;
@@ -192,9 +192,6 @@ ioctl_iow_nr!(
     0xe1,
     kvm_bindings::kvm_device_attr
 );
-// Added in Linux 6.13. kvm-ioctls does not expose the vCPU wrapper yet.
-#[cfg(target_arch = "x86_64")]
-ioctl_iowr_nr!(KVM_PRE_FAULT_MEMORY, KVMIO, 0xd5, kvm_pre_fault_memory);
 #[cfg(target_arch = "x86_64")]
 ioctl_iow_nr!(
     KVM_GET_DEVICE_ATTR,
@@ -1993,31 +1990,6 @@ impl cpu::Vcpu for KvmVcpu {
         {
             kvm_bindings::kvm_riscv_core::default().into()
         }
-    }
-    #[cfg(target_arch = "x86_64")]
-    fn pre_fault_memory(&self, gpa: u64, size: u64) -> cpu::Result<()> {
-        let mut range = kvm_pre_fault_memory {
-            gpa,
-            size,
-            flags: 0,
-            padding: [0; 5],
-        };
-
-        while range.size > 0 {
-            // SAFETY: the request points to initialized writable memory and
-            // the ioctl is issued on this live vCPU fd.
-            let ret = unsafe { ioctl_with_mut_ref(&self.fd, KVM_PRE_FAULT_MEMORY(), &mut range) };
-            if ret == 0 {
-                continue;
-            }
-            let error = errno::Error::last();
-            if error.errno() == libc::EINTR {
-                continue;
-            }
-            return Err(cpu::HypervisorCpuError::PreFaultMemory(error.into()));
-        }
-
-        Ok(())
     }
     #[cfg(target_arch = "x86_64")]
     ///
