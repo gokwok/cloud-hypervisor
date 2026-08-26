@@ -2035,12 +2035,21 @@ impl MemoryManager {
                 None
             };
 
+            // Private mmap restore must not use the regular write-prefault path:
+            // MADV_POPULATE_WRITE would eagerly break copy-on-write. Host
+            // prefaulting is performed with read semantics after all mappings
+            // have been registered instead.
+            let region_prefault = if memory_restore_mode == MemoryRestoreMode::Mmap {
+                false
+            } else {
+                prefault
+            };
             let mm = {
                 trace_scoped!("restore.memory.create_regions");
                 MemoryManager::new_internal(
                     vm,
                     config,
-                    Some(prefault),
+                    Some(region_prefault),
                     phys_bits,
                     #[cfg(feature = "tdx")]
                     false,
@@ -2067,6 +2076,12 @@ impl MemoryManager {
                 }
                 MemoryRestoreMode::Mmap => {
                     info!("Mmap restore: private file-backed guest memory enabled");
+                    if prefault {
+                        trace_scoped!("restore.memory.mmap_host_prefault");
+                        mm.lock()
+                            .unwrap()
+                            .prefault_mmap_restore(&mem_snapshot.memory_ranges)?;
+                    }
                 }
             }
 
@@ -2074,6 +2089,38 @@ impl MemoryManager {
         } else {
             Err(Error::RestoreMissingSourceUrl)
         }
+    }
+
+    /// Populate the Host page tables and page cache for an mmap restore while
+    /// preserving the private mapping's copy-on-write sharing.
+    fn prefault_mmap_restore(&self, ranges: &MemoryRangeTable) -> Result<(), Error> {
+        let started = time::Instant::now();
+        let guest_memory = self.guest_memory.memory();
+        let mut total = 0u64;
+
+        for range in ranges.regions() {
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(range.gpa))
+                .map_err(|error| Error::PrefaultMemory(io::Error::other(error.to_string())))?;
+            let length = usize::try_from(range.length).map_err(|error| {
+                Error::PrefaultMemory(io::Error::new(io::ErrorKind::InvalidInput, error))
+            })?;
+            // SAFETY: the address and length describe a live GuestMemoryMmap
+            // region, and MADV_POPULATE_READ does not modify its contents.
+            let ret = unsafe { libc::madvise(host_addr.cast(), length, libc::MADV_POPULATE_READ) };
+            if ret != 0 {
+                return Err(Error::PrefaultMemory(io::Error::last_os_error()));
+            }
+            total = total.saturating_add(range.length);
+        }
+
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=mmap_host_prefault bytes={} total_us={}",
+            total,
+            started.elapsed().as_micros()
+        );
+        Ok(())
     }
 
     fn memfd_create(name: &ffi::CStr, flags: u32) -> Result<RawFd, io::Error> {

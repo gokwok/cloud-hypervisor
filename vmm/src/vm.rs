@@ -557,6 +557,8 @@ pub struct Vm {
     // The hypervisor abstracted virtual machine.
     vm: Arc<dyn hypervisor::Vm>,
     saved_clock: Option<SavedClock>,
+    /// One-shot KVM stage-2 prefault requested for the first snapshot resume.
+    kvm_prefault: bool,
     #[cfg(not(target_arch = "riscv64"))]
     numa_nodes: NumaNodes,
     #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
@@ -748,6 +750,7 @@ impl Vm {
             memory_manager,
             vm,
             saved_clock,
+            kvm_prefault: false,
             #[cfg(not(target_arch = "riscv64"))]
             numa_nodes,
             #[cfg(not(target_arch = "riscv64"))]
@@ -3266,6 +3269,43 @@ impl Vm {
             .map_err(|e| MigratableError::Resume(anyhow!("Could not restore guest clock: {e}")))
     }
 
+    pub fn enable_kvm_prefault(&mut self) {
+        self.kvm_prefault = true;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn pre_fault_guest_memory(&mut self) -> result::Result<(), MigratableError> {
+        if !std::mem::take(&mut self.kvm_prefault) {
+            return Ok(());
+        }
+
+        let ranges = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .memory_range_table(false)?;
+        let boot_vcpu = self
+            .cpu_manager
+            .lock()
+            .unwrap()
+            .boot_vcpu()
+            .ok_or_else(|| MigratableError::Resume(anyhow!("No boot vCPU for KVM prefault")))?;
+        let boot_vcpu = boot_vcpu.lock().unwrap();
+        for range in ranges.regions() {
+            boot_vcpu
+                .hypervisor_vcpu()
+                .pre_fault_memory(range.gpa, range.length)
+                .map_err(|error| {
+                    MigratableError::Resume(anyhow!(
+                        "Could not prefault KVM memory at {:#x}+{:#x}: {error}",
+                        range.gpa,
+                        range.length
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn device_manager(&self) -> &Arc<Mutex<DeviceManager>> {
         &self.device_manager
     }
@@ -3321,6 +3361,11 @@ impl Pausable for Vm {
         let guest_clock_us = phase_started.elapsed().as_micros();
 
         let phase_started = Instant::now();
+        #[cfg(target_arch = "x86_64")]
+        self.pre_fault_guest_memory()?;
+        let kvm_prefault_us = phase_started.elapsed().as_micros();
+
+        let phase_started = Instant::now();
         if current_state == VmState::Paused {
             self.vm
                 .resume()
@@ -3340,11 +3385,12 @@ impl Pausable for Vm {
         event!("vm", "resumed");
         warn!(
             target: "ch_timing",
-            "ch_timing event=ch_vm_resume started_unix_us={} finished_unix_us={} validation_us={} guest_clock_us={} hypervisor_us={} devices_us={} vcpus_us={} total_us={}",
+            "ch_timing event=ch_vm_resume started_unix_us={} finished_unix_us={} validation_us={} guest_clock_us={} kvm_prefault_us={} hypervisor_us={} devices_us={} vcpus_us={} total_us={}",
             started_unix_us,
             unix_time_us(),
             validation_us,
             guest_clock_us,
+            kvm_prefault_us,
             hypervisor_us,
             devices_us,
             vcpus_us,

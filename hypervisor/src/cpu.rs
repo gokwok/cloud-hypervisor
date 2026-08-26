@@ -189,6 +189,12 @@ pub enum HypervisorCpuError {
     ///
     #[error("Failed to notify guest its clock was paused")]
     NotifyGuestClockPaused(#[source] anyhow::Error),
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Error populating KVM stage-2 mappings before vCPU resume
+    ///
+    #[error("Failed to prefault vCPU memory")]
+    PreFaultMemory(#[source] anyhow::Error),
     ///
     /// Setting debug register error
     ///
@@ -473,6 +479,15 @@ pub trait Vcpu: Send + Sync {
     ///
     fn notify_guest_clock_paused(&self) -> Result<()> {
         Ok(())
+    }
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Populate stage-2 mappings for a Guest physical-address range.
+    ///
+    fn pre_fault_memory(&self, _gpa: u64, _size: u64) -> Result<()> {
+        Err(HypervisorCpuError::PreFaultMemory(anyhow!(
+            "hypervisor does not support stage-2 memory prefaulting"
+        )))
     }
     ///
     /// Sets debug registers to set hardware breakpoints and/or enable single step.

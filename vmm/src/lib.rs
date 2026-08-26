@@ -1910,6 +1910,7 @@ impl Vmm {
         source_url: &str,
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
+        kvm_prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
     ) -> result::Result<(), VmError> {
         match &self.vm {
@@ -1974,6 +1975,9 @@ impl Vmm {
                         Some(memory_restore_mode),
                     )?
                 };
+                if kvm_prefault {
+                    vm.enable_kvm_prefault();
+                }
 
                 if self
                     .vm_config
@@ -2405,6 +2409,7 @@ impl RequestHandler for Vmm {
                     source_url,
                     vm_config,
                     restore_cfg.prefault,
+                    restore_cfg.kvm_prefault,
                     restore_cfg.memory_restore_mode,
                 )
                 .map_err(|e| {

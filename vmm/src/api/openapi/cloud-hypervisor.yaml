@@ -1496,6 +1496,10 @@ components:
           type: string
         prefault:
           type: boolean
+          description: Eagerly populate Host memory mappings before resume.
+        kvm_prefault:
+          type: boolean
+          description: Populate KVM stage-2 mappings before restored vCPUs run.
         memory_restore_mode:
           $ref: "#/components/schemas/MemoryRestoreMode"
         resume:

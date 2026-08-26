@@ -404,9 +404,6 @@ pub enum ValidationError {
     /// Prefault cannot be combined with on-demand restore
     #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
     InvalidRestorePrefaultWithOnDemand,
-    /// Prefault cannot be combined with mmap restore
-    #[error("'prefault' cannot be combined with 'memory_restore_mode=mmap'")]
-    InvalidRestorePrefaultWithMmap,
     /// Mmap restore requires private guest memory
     #[error("'memory_restore_mode=mmap' requires private guest memory")]
     MmapRestoreRequiresPrivateMemory,
@@ -2874,6 +2871,9 @@ pub struct RestoreConfig {
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
+    /// Populate KVM's stage-2 page tables before the restored vCPUs run.
+    #[serde(default)]
+    pub kvm_prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
     #[serde(default)]
@@ -2884,10 +2884,11 @@ pub struct RestoreConfig {
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|mmap,\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,kvm_prefault=on|off,memory_restore_mode=copy|ondemand|mmap,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
-        \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
+        \n`prefault` controls eager Host mapping prefaulting; for mmap restore it uses read faults and preserves copy-on-write (disabled by default) \
+        \n`kvm_prefault` populates KVM stage-2 mappings before restored vCPUs run without breaking copy-on-write (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables userfaultfd demand paging, and `memory_restore_mode=mmap` maps the snapshot privately for kernel demand paging and copy-on-write \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
@@ -2898,6 +2899,7 @@ impl RestoreConfig {
         parser
             .add("source_url")
             .add("prefault")
+            .add("kvm_prefault")
             .add("memory_restore_mode")
             .add("net_fds")
             .add("resume");
@@ -2909,6 +2911,11 @@ impl RestoreConfig {
             .ok_or(Error::ParseRestoreSourceUrlMissing)?;
         let prefault = parser
             .convert::<Toggle>("prefault")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let kvm_prefault = parser
+            .convert::<Toggle>("kvm_prefault")
             .map_err(Error::ParseRestore)?
             .unwrap_or(Toggle(false))
             .0;
@@ -2937,6 +2944,7 @@ impl RestoreConfig {
         Ok(RestoreConfig {
             source_url,
             prefault,
+            kvm_prefault,
             memory_restore_mode,
             net_fds,
             resume,
@@ -2949,9 +2957,6 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
-        }
-        if self.memory_restore_mode == MemoryRestoreMode::Mmap && self.prefault {
-            return Err(ValidationError::InvalidRestorePrefaultWithMmap);
         }
         if self.memory_restore_mode == MemoryRestoreMode::Mmap
             && (vm_config.memory.shared
@@ -5184,6 +5189,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
+                kvm_prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
                 resume: false,
@@ -5196,6 +5202,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
+                kvm_prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: Some(vec![
                     RestoredNetConfig {
@@ -5217,16 +5224,20 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
+                kvm_prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
                 net_fds: None,
                 resume: false,
             }
         );
         assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=mmap")?,
+            RestoreConfig::parse(
+                "source_url=/path/to/snapshot,memory_restore_mode=mmap,kvm_prefault=on"
+            )?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
+                kvm_prefault: true,
                 memory_restore_mode: MemoryRestoreMode::Mmap,
                 net_fds: None,
                 resume: false,
@@ -5237,6 +5248,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
+                kvm_prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
                 resume: true,
@@ -5346,6 +5358,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let valid_config = RestoreConfig {
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
+            kvm_prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
             net_fds: Some(vec![
                 RestoredNetConfig {
@@ -5422,6 +5435,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let another_valid_config = RestoreConfig {
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
+            kvm_prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
             net_fds: None,
             resume: false,
@@ -5439,6 +5453,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let invalid_restore_mode = RestoreConfig {
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
+            kvm_prefault: false,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
             net_fds: None,
             resume: false,
@@ -5448,14 +5463,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
         );
 
-        let invalid_mmap_prefault = RestoreConfig {
+        let mmap_prefault = RestoreConfig {
             memory_restore_mode: MemoryRestoreMode::Mmap,
             ..invalid_restore_mode.clone()
         };
-        assert_eq!(
-            invalid_mmap_prefault.validate(&snapshot_vm_config),
-            Err(ValidationError::InvalidRestorePrefaultWithMmap)
-        );
+        mmap_prefault.validate(&snapshot_vm_config).unwrap();
 
         let mmap_restore = RestoreConfig {
             prefault: false,
