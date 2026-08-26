@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{any, io, mem, panic, path, process, result, thread};
 
 use anyhow::{Context, anyhow};
@@ -106,6 +106,13 @@ pub mod vm_config;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
+
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
 
 /// Errors associated with VMM management
 #[derive(Debug, Error)]
@@ -2356,6 +2363,8 @@ impl RequestHandler for Vmm {
                 if self.vm_config.is_some() {
                     return Err(VmError::VmAlreadyCreated);
                 }
+                let restore_started = Instant::now();
+                let started_unix_us = unix_time_us();
 
                 let source_url = restore_cfg.source_url.as_path().to_str();
                 if source_url.is_none() {
@@ -2364,9 +2373,12 @@ impl RequestHandler for Vmm {
                 // Safe to unwrap as we checked it was Some(&str).
                 let source_url = source_url.unwrap();
 
+                let phase_started = Instant::now();
                 let vm_config = Arc::new(Mutex::new(
                     recv_vm_config(source_url).map_err(VmError::Restore)?,
                 ));
+                let config_read_us = phase_started.elapsed().as_micros();
+                let phase_started = Instant::now();
                 restore_cfg
                     .validate(&vm_config.lock().unwrap().clone())
                     .map_err(VmError::ConfigValidation)?;
@@ -2386,20 +2398,15 @@ impl RequestHandler for Vmm {
                         }
                     }
                 }
+                let config_prepare_us = phase_started.elapsed().as_micros();
 
+                let phase_started = Instant::now();
                 self.vm_restore(
                     source_url,
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
                 )
-                .and_then(|()| {
-                    if restore_cfg.resume {
-                        self.vm_resume()
-                    } else {
-                        Ok(())
-                    }
-                })
                 .map_err(|e| {
                     error!("VM Restore failed: {e:?}");
                     if let Err(e) = self.vm_delete() {
@@ -2407,6 +2414,31 @@ impl RequestHandler for Vmm {
                     }
                     e
                 })?;
+                let vm_build_us = phase_started.elapsed().as_micros();
+
+                let phase_started = Instant::now();
+                if restore_cfg.resume {
+                    self.vm_resume().map_err(|e| {
+                        error!("VM Restore resume failed: {e:?}");
+                        if let Err(delete_error) = self.vm_delete() {
+                            return delete_error;
+                        }
+                        e
+                    })?;
+                }
+                let resume_us = phase_started.elapsed().as_micros();
+
+                info!(
+                    target: "ch_timing",
+                    "event=ch_restore started_unix_us={} finished_unix_us={} config_read_us={} config_prepare_us={} vm_build_us={} resume_us={} total_us={}",
+                    started_unix_us,
+                    unix_time_us(),
+                    config_read_us,
+                    config_prepare_us,
+                    vm_build_us,
+                    resume_us,
+                    restore_started.elapsed().as_micros(),
+                );
 
                 Ok(())
             }

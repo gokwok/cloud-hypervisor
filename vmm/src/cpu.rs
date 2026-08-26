@@ -18,6 +18,7 @@ use std::mem::zeroed;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::{Instant, SystemTime};
 use std::{any, cmp, hint, io, panic, result, thread, time};
 
 #[cfg(target_arch = "aarch64")]
@@ -762,6 +763,18 @@ impl TryFrom<i32> for CoreSchedulingLeader {
 }
 
 /// Management structure for a vCPU (thread).
+struct VcpuResumeTiming {
+    started_at: Instant,
+    started_unix_us: u64,
+}
+
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
 #[derive(Default)]
 struct VcpuState {
     inserting: bool,
@@ -775,6 +788,8 @@ struct VcpuState {
     vcpu_run_interrupted: Arc<AtomicBool>,
     /// Used to ACK state changes from the run vCPU loop to the CPU Manager.
     paused: Arc<AtomicBool>,
+    /// Marks the current resume so the vCPU thread can report its first run entry.
+    resume_timing: Arc<Mutex<Option<VcpuResumeTiming>>>,
 }
 
 impl VcpuState {
@@ -1200,6 +1215,9 @@ impl CpuManager {
         let vcpu_paused = vcpu_states[usize::try_from(vcpu_id).unwrap()]
             .paused
             .clone();
+        let vcpu_resume_timing = vcpu_states[usize::try_from(vcpu_id).unwrap()]
+            .resume_timing
+            .clone();
 
         // Prepare the CPU set the current vCPU is expected to run onto.
         let cpuset = self.affinity.get(&vcpu_id).map(|host_cpus| {
@@ -1400,6 +1418,17 @@ impl CpuManager {
                             {
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
                                 break;
+                            }
+
+                            if let Some(timing) = vcpu_resume_timing.lock().unwrap().take() {
+                                info!(
+                                    target: "ch_timing",
+                                    "event=ch_vcpu_first_run cpu_id={} resume_started_unix_us={} first_run_unix_us={} resume_to_first_run_us={}",
+                                    vcpu_id,
+                                    timing.started_unix_us,
+                                    unix_time_us(),
+                                    timing.started_at.elapsed().as_micros(),
+                                );
                             }
 
                             let mut vcpu = vcpu.lock().unwrap();
@@ -2771,6 +2800,12 @@ impl Pausable for CpuManager {
         // Step 1/2: signal each thread
         {
             for state in vcpu_states.iter() {
+                if state.active() {
+                    *state.resume_timing.lock().unwrap() = Some(VcpuResumeTiming {
+                        started_at: Instant::now(),
+                        started_unix_us: unix_time_us(),
+                    });
+                }
                 state.unpark_thread();
             }
         }

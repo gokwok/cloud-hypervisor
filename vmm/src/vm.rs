@@ -20,8 +20,7 @@ use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
-#[cfg(not(target_arch = "riscv64"))]
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use std::{any, cmp, result, str, thread};
 
 use anyhow::{Context, anyhow};
@@ -118,10 +117,18 @@ use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
     NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
+
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
     MEMORY_MANAGER_SNAPSHOT_ID, PciDeviceInfo, acpi, cpu,
 };
+
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
 
 /// Errors associated with VM management
 #[derive(Debug, Error)]
@@ -3297,28 +3304,52 @@ impl Pausable for Vm {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         event!("vm", "resuming");
+        let resume_started = Instant::now();
+        let started_unix_us = unix_time_us();
+        let phase_started = Instant::now();
         let current_state = self.get_state();
         let new_state = VmState::Running;
 
         self.state
             .valid_transition(new_state)
             .map_err(|e| MigratableError::Resume(anyhow!("Invalid transition: {e:?}")))?;
+        let validation_us = phase_started.elapsed().as_micros();
 
         // Restore the guest clock before the vCPUs start running.
+        let phase_started = Instant::now();
         self.restore_guest_clock()?;
+        let guest_clock_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         if current_state == VmState::Paused {
             self.vm
                 .resume()
                 .map_err(|e| MigratableError::Resume(anyhow!("Could not resume the VM: {e}")))?;
         }
+        let hypervisor_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         self.device_manager.lock().unwrap().resume()?;
+        let devices_us = phase_started.elapsed().as_micros();
+        let phase_started = Instant::now();
         self.cpu_manager.lock().unwrap().resume()?;
+        let vcpus_us = phase_started.elapsed().as_micros();
 
         // And we're back to the Running state.
         self.state = new_state;
         event!("vm", "resumed");
+        info!(
+            target: "ch_timing",
+            "event=ch_vm_resume started_unix_us={} finished_unix_us={} validation_us={} guest_clock_us={} hypervisor_us={} devices_us={} vcpus_us={} total_us={}",
+            started_unix_us,
+            unix_time_us(),
+            validation_us,
+            guest_clock_us,
+            hypervisor_us,
+            devices_us,
+            vcpus_us,
+            resume_started.elapsed().as_micros(),
+        );
         Ok(())
     }
 }

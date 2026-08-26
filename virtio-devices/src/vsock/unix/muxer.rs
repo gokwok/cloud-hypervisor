@@ -45,6 +45,7 @@ use std::io::{self, ErrorKind, Read};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::str;
+use std::time::{Instant, SystemTime};
 
 use log::{debug, error, info, warn};
 
@@ -105,6 +106,22 @@ struct PartiallyReadCommand {
     len: usize,
 }
 
+struct HostConnectTiming {
+    accepted_at: Instant,
+    accepted_unix_us: u64,
+    command_at: Instant,
+    command_unix_us: u64,
+    guest_request_at: Option<Instant>,
+    guest_request_unix_us: Option<u64>,
+}
+
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
 /// The vsock connection multiplexer.
 ///
 pub struct VsockMuxer {
@@ -116,6 +133,10 @@ pub struct VsockMuxer {
     listener_map: HashMap<RawFd, EpollListener>,
     /// A hash map used to store partially read "connect" commands.
     partial_command_map: HashMap<RawFd, PartiallyReadCommand>,
+    /// Accept timestamps for host sockets which have not sent a complete CONNECT command yet.
+    host_accept_timing: HashMap<RawFd, (Instant, u64)>,
+    /// Timing state for host-initiated connections until the guest accepts them.
+    host_connect_timing: HashMap<ConnMapKey, HostConnectTiming>,
     /// The RX queue. Items in this queue are consumed by `VsockMuxer::recv_pkt()`, and
     /// produced
     /// - by `VsockMuxer::send_pkt()` (e.g. RST in response to a connection request packet);
@@ -186,6 +207,14 @@ impl VsockChannel for VsockMuxer {
                         conn_res = conn.recv_pkt(pkt);
                         do_pop = !conn.has_pending_rx();
                     });
+                    if conn_res.is_ok()
+                        && pkt.op() == uapi::VSOCK_OP_REQUEST
+                        && let Some(timing) = self.host_connect_timing.get_mut(&key)
+                        && timing.guest_request_at.is_none()
+                    {
+                        timing.guest_request_at = Some(Instant::now());
+                        timing.guest_request_unix_us = Some(unix_time_us());
+                    }
                     if do_pop {
                         self.rxq.pop().unwrap();
                     }
@@ -390,6 +419,8 @@ impl VsockMuxer {
             conn_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
             listener_map: HashMap::with_capacity(defs::MAX_CONNECTIONS + 1),
             partial_command_map: Default::default(),
+            host_accept_timing: Default::default(),
+            host_connect_timing: Default::default(),
             killq: MuxerKillQ::new(),
             local_port_last: (1u32 << 30) - 1,
             local_port_set: HashSet::with_capacity(defs::MAX_CONNECTIONS),
@@ -443,7 +474,11 @@ impl VsockMuxer {
                         // the guest side, we need to know the destination port. We'll read
                         // that port from a "connect" command received on this socket, so the
                         // next step is to ask to be notified the moment we can read from it.
-                        self.add_listener(stream.as_raw_fd(), EpollListener::LocalStream(stream))
+                        let fd = stream.as_raw_fd();
+                        self.add_listener(fd, EpollListener::LocalStream(stream))?;
+                        self.host_accept_timing
+                            .insert(fd, (Instant::now(), unix_time_us()));
+                        Ok(())
                     })
                     .unwrap_or_else(|err| {
                         warn!("vsock: unable to accept local connection: {err:?}");
@@ -471,6 +506,7 @@ impl VsockMuxer {
                     // the command from the map
                     self.partial_command_map.remove(&stream.as_raw_fd());
 
+                    let accepted = self.host_accept_timing.remove(&fd);
                     let stream = match self.remove_listener(fd) {
                         Some(EpollListener::LocalStream(s)) => s,
                         _ => unreachable!(),
@@ -478,12 +514,14 @@ impl VsockMuxer {
 
                     port.and_then(|peer_port| {
                         let local_port = self.allocate_local_port();
-
+                        let key = ConnMapKey {
+                            local_port,
+                            peer_port,
+                        };
+                        let command_at = Instant::now();
+                        let command_unix_us = unix_time_us();
                         self.add_connection(
-                            ConnMapKey {
-                                local_port,
-                                peer_port,
-                            },
+                            key,
                             MuxerConnection::new_local_init(
                                 stream,
                                 uapi::VSOCK_HOST_CID,
@@ -491,7 +529,21 @@ impl VsockMuxer {
                                 local_port,
                                 peer_port,
                             ),
-                        )
+                        )?;
+                        let (accepted_at, accepted_unix_us) =
+                            accepted.unwrap_or((command_at, command_unix_us));
+                        self.host_connect_timing.insert(
+                            key,
+                            HostConnectTiming {
+                                accepted_at,
+                                accepted_unix_us,
+                                command_at,
+                                command_unix_us,
+                                guest_request_at: None,
+                                guest_request_unix_us: None,
+                            },
+                        );
+                        Ok(())
                     })
                     .unwrap_or_else(|err| {
                         info!("vsock: error adding local-init connection: {err:?}");
@@ -613,6 +665,7 @@ impl VsockMuxer {
     /// Remove a connection from the active connection poll.
     ///
     fn remove_connection(&mut self, key: ConnMapKey) {
+        self.host_connect_timing.remove(&key);
         if let Some(conn) = self.conn_map.remove(&key) {
             self.remove_listener(conn.get_polled_fd());
         }
@@ -761,7 +814,31 @@ impl VsockMuxer {
             if prev_state == ConnState::LocalInit && conn.state() == ConnState::Established {
                 let msg = format!("OK {}\n", key.local_port);
                 match conn.send_bytes_raw(msg.as_bytes()) {
-                    Ok(written) if written == msg.len() => (),
+                    Ok(written) if written == msg.len() => {
+                        if let Some(timing) = self.host_connect_timing.remove(&key) {
+                            let finished_at = Instant::now();
+                            let finished_unix_us = unix_time_us();
+                            let guest_request_at =
+                                timing.guest_request_at.unwrap_or(timing.command_at);
+                            let guest_request_unix_us = timing
+                                .guest_request_unix_us
+                                .unwrap_or(timing.command_unix_us);
+                            info!(
+                                target: "ch_timing",
+                                "event=ch_vsock_connect local_port={} peer_port={} accepted_unix_us={} command_unix_us={} guest_request_unix_us={} finished_unix_us={} accept_to_command_us={} command_to_guest_request_us={} guest_response_us={} total_us={}",
+                                key.local_port,
+                                key.peer_port,
+                                timing.accepted_unix_us,
+                                timing.command_unix_us,
+                                guest_request_unix_us,
+                                finished_unix_us,
+                                timing.command_at.duration_since(timing.accepted_at).as_micros(),
+                                guest_request_at.duration_since(timing.command_at).as_micros(),
+                                finished_at.duration_since(guest_request_at).as_micros(),
+                                finished_at.duration_since(timing.accepted_at).as_micros(),
+                            );
+                        }
+                    }
                     Ok(_) => {
                         // If we can't write a dozen bytes to a pristine connection something
                         // must be really wrong. Killing it.
