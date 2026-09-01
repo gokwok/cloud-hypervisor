@@ -404,9 +404,6 @@ pub enum ValidationError {
     /// Prefault cannot be combined with on-demand restore
     #[error("'prefault' cannot be combined with 'memory_restore_mode=ondemand'")]
     InvalidRestorePrefaultWithOnDemand,
-    /// Prefault cannot be combined with mmap restore
-    #[error("'prefault' cannot be combined with 'memory_restore_mode=mmap'")]
-    InvalidRestorePrefaultWithMmap,
     /// Mmap restore requires private guest memory
     #[error("'memory_restore_mode=mmap' requires private guest memory")]
     MmapRestoreRequiresPrivateMemory,
@@ -2887,7 +2884,7 @@ impl RestoreConfig {
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|mmap,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
-        \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
+        \n`prefault` eagerly populates host mappings and, for mmap restore on supported KVM hosts, second-stage mappings before vCPUs resume (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables userfaultfd demand paging, and `memory_restore_mode=mmap` maps the snapshot privately for kernel demand paging and copy-on-write \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
@@ -2949,9 +2946,6 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
-        }
-        if self.memory_restore_mode == MemoryRestoreMode::Mmap && self.prefault {
-            return Err(ValidationError::InvalidRestorePrefaultWithMmap);
         }
         if self.memory_restore_mode == MemoryRestoreMode::Mmap
             && (vm_config.memory.shared
@@ -5448,14 +5442,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
         );
 
-        let invalid_mmap_prefault = RestoreConfig {
+        let mmap_prefault = RestoreConfig {
             memory_restore_mode: MemoryRestoreMode::Mmap,
             ..invalid_restore_mode.clone()
         };
-        assert_eq!(
-            invalid_mmap_prefault.validate(&snapshot_vm_config),
-            Err(ValidationError::InvalidRestorePrefaultWithMmap)
-        );
+        mmap_prefault.validate(&snapshot_vm_config).unwrap();
 
         let mmap_restore = RestoreConfig {
             prefault: false,

@@ -556,6 +556,9 @@ pub struct Vm {
     // The hypervisor abstracted virtual machine.
     vm: Arc<dyn hypervisor::Vm>,
     saved_clock: Option<SavedClock>,
+    // One-shot KVM second-stage prefault requested for an mmap snapshot
+    // restore. It must complete before restored vCPU threads are unparked.
+    stage2_prefault_pending: bool,
     #[cfg(not(target_arch = "riscv64"))]
     numa_nodes: NumaNodes,
     #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
@@ -599,6 +602,7 @@ impl Vm {
         console_resize_pipe: Option<Arc<File>>,
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
+        stage2_prefault: bool,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
@@ -747,6 +751,7 @@ impl Vm {
             memory_manager,
             vm,
             saved_clock,
+            stage2_prefault_pending: stage2_prefault,
             #[cfg(not(target_arch = "riscv64"))]
             numa_nodes,
             #[cfg(not(target_arch = "riscv64"))]
@@ -1459,6 +1464,10 @@ impl Vm {
                 .map_err(Error::MemoryManager)?
             };
 
+        let stage2_prefault = snapshot.is_some()
+            && prefault.unwrap_or(false)
+            && memory_restore_mode.unwrap_or_default() == MemoryRestoreMode::Mmap;
+
         {
             trace_scoped!("restore.vm_components");
             Vm::new_from_memory_manager(
@@ -1479,6 +1488,7 @@ impl Vm {
                 console_resize_pipe,
                 original_termios,
                 snapshot,
+                stage2_prefault,
                 #[cfg(feature = "igvm")]
                 igvm_file,
             )
@@ -3319,6 +3329,47 @@ impl Pausable for Vm {
         self.restore_guest_clock()?;
         let guest_clock_us = phase_started.elapsed().as_micros();
 
+        let stage2_prefault_started = Instant::now();
+        let stage2_prefault_requested =
+            current_state == VmState::Paused && self.stage2_prefault_pending;
+        let mut stage2_prefault_supported = false;
+        let mut stage2_prefault_ranges = 0usize;
+        let mut stage2_prefault_bytes = 0u64;
+        if stage2_prefault_requested {
+            let ranges = self.memory_manager.lock().unwrap().guest_ram_ranges();
+            stage2_prefault_ranges = ranges.len();
+            stage2_prefault_bytes = ranges.iter().map(|(_, size)| *size).sum();
+            let boot_vcpu = self
+                .cpu_manager
+                .lock()
+                .unwrap()
+                .boot_vcpu()
+                .ok_or_else(|| {
+                    MigratableError::Resume(anyhow!(
+                        "Cannot prefault second-stage mappings without a boot vCPU"
+                    ))
+                })?;
+            let boot_vcpu = boot_vcpu.lock().unwrap();
+            stage2_prefault_supported = true;
+            for (gpa, size) in ranges {
+                if !boot_vcpu
+                    .hypervisor_vcpu()
+                    .prefault_memory(gpa, size)
+                    .map_err(|error| {
+                        MigratableError::Resume(anyhow!(
+                            "Could not prefault second-stage mappings: {error}"
+                        ))
+                    })?
+                {
+                    stage2_prefault_supported = false;
+                    warn!("KVM_PRE_FAULT_MEMORY is unavailable; restored memory will fault lazily");
+                    break;
+                }
+            }
+            self.stage2_prefault_pending = false;
+        }
+        let stage2_prefault_us = stage2_prefault_started.elapsed().as_micros();
+
         let phase_started = Instant::now();
         if current_state == VmState::Paused {
             self.vm
@@ -3339,11 +3390,16 @@ impl Pausable for Vm {
         event!("vm", "resumed");
         warn!(
             target: "ch_timing",
-            "ch_timing event=ch_vm_resume started_unix_us={} finished_unix_us={} validation_us={} guest_clock_us={} hypervisor_us={} devices_us={} vcpus_us={} total_us={}",
+            "ch_timing event=ch_vm_resume started_unix_us={} finished_unix_us={} validation_us={} guest_clock_us={} stage2_prefault_requested={} stage2_prefault_supported={} stage2_prefault_ranges={} stage2_prefault_bytes={} stage2_prefault_us={} hypervisor_us={} devices_us={} vcpus_us={} total_us={}",
             started_unix_us,
             unix_time_us(),
             validation_us,
             guest_clock_us,
+            u8::from(stage2_prefault_requested),
+            u8::from(stage2_prefault_supported),
+            stage2_prefault_ranges,
+            stage2_prefault_bytes,
+            stage2_prefault_us,
             hypervisor_us,
             devices_us,
             vcpus_us,

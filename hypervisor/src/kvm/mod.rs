@@ -114,6 +114,8 @@ pub mod riscv64;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_X86_DEFAULT_VM;
+#[cfg(feature = "tdx")]
+use kvm_bindings::KVM_X86_SW_PROTECTED_VM;
 ///
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
 ///
@@ -124,9 +126,10 @@ use kvm_bindings::nested::KvmNestedStateBuffer;
 pub use kvm_bindings::{
     self, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP,
     KVM_IRQ_ROUTING_MSI, KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
-    KVM_MSI_VALID_DEVID, kvm_clock_data, kvm_create_device, kvm_create_device as CreateDevice,
-    kvm_device_attr as DeviceAttr, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
-    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region,
+    KVM_MSI_VALID_DEVID, KVMIO, kvm_clock_data, kvm_create_device,
+    kvm_create_device as CreateDevice, kvm_device_attr as DeviceAttr,
+    kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug, kvm_irq_routing, kvm_irq_routing_entry,
+    kvm_mp_state, kvm_pre_fault_memory, kvm_run, kvm_userspace_memory_region,
     kvm_userspace_memory_region2,
 };
 #[cfg(target_arch = "aarch64")]
@@ -140,20 +143,20 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, KVM_REG_RISCV_TIMER, kvm_riscv_core};
-#[cfg(feature = "tdx")]
-use kvm_bindings::{KVM_X86_SW_PROTECTED_VM, KVMIO};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
 pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
 use log::error;
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
+use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::ioctl::ioctl_with_ref;
+#[cfg(feature = "tdx")]
+use vmm_sys_util::ioctl::ioctl_with_val;
+use vmm_sys_util::ioctl_iowr_nr;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::{fam::FamStruct, ioctl_io_nr, ioctl_iow_nr};
-#[cfg(feature = "tdx")]
-use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;
@@ -278,6 +281,11 @@ const TDG_VP_VMCALL_INVALID_OPERAND: u64 = 0x8000000000000000;
 
 #[cfg(feature = "tdx")]
 ioctl_iowr_nr!(KVM_MEMORY_ENCRYPT_OP, KVMIO, 0xba, raw::c_ulong);
+
+// Linux 6.13 added KVM_PRE_FAULT_MEMORY as a vCPU ioctl. kvm-bindings exposes
+// its argument structure and capability number, but kvm-ioctls 0.25 does not
+// yet provide a safe wrapper.
+ioctl_iowr_nr!(KVM_PRE_FAULT_MEMORY, KVMIO, 0xd5, kvm_pre_fault_memory);
 
 #[cfg(feature = "tdx")]
 #[repr(u32)]
@@ -2476,6 +2484,40 @@ impl cpu::Vcpu for KvmVcpu {
         self.fd
             .set_mp_state(mp_state.into())
             .map_err(|e| cpu::HypervisorCpuError::SetMpState(e.into()))
+    }
+
+    fn prefault_memory(&self, gpa: u64, size: u64) -> cpu::Result<bool> {
+        let mut request = kvm_pre_fault_memory {
+            gpa,
+            size,
+            flags: 0,
+            padding: [0; 5],
+        };
+
+        while request.size > 0 {
+            let previous_gpa = request.gpa;
+            let previous_size = request.size;
+            // SAFETY: `self.fd` is a live vCPU fd and `request` is the exact
+            // in/out structure specified by KVM_PRE_FAULT_MEMORY.
+            let ret = unsafe { ioctl_with_mut_ref(&self.fd, KVM_PRE_FAULT_MEMORY(), &mut request) };
+            if ret < 0 {
+                let error = errno::Error::last();
+                match error.errno() {
+                    libc::EINTR => continue,
+                    libc::ENOTTY | libc::EOPNOTSUPP => return Ok(false),
+                    _ => {
+                        return Err(cpu::HypervisorCpuError::PreFaultMemory(error.into()));
+                    }
+                }
+            }
+            if request.size >= previous_size || (request.size > 0 && request.gpa <= previous_gpa) {
+                return Err(cpu::HypervisorCpuError::PreFaultMemory(anyhow!(
+                    "KVM_PRE_FAULT_MEMORY made no progress for gpa={previous_gpa:#x} size={previous_size:#x}"
+                )));
+            }
+        }
+
+        Ok(true)
     }
 
     #[cfg(target_arch = "x86_64")]

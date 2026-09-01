@@ -893,12 +893,18 @@ impl MemoryManager {
                             guest_ram_mapping.file_offset,
                         )
                     };
+                    let requested_prefault = prefault.unwrap_or(zone_config.prefault);
+                    // A private mmap restore must only prefault for reads. The
+                    // regular prefault path uses MADV_POPULATE_WRITE, which
+                    // would eagerly break copy-on-write for every snapshot
+                    // page and defeat mmap restore's sharing semantics.
+                    let mmap_prefault = requested_prefault && mmap_restore_source.is_some();
                     let region = MemoryManager::create_ram_region(
                         &backing_file,
                         file_offset,
                         GuestAddress(guest_ram_mapping.gpa),
                         guest_ram_mapping.size as usize,
-                        prefault.unwrap_or(zone_config.prefault),
+                        requested_prefault && !mmap_prefault,
                         zone_config.reserve,
                         zone_config.shared,
                         zone_config.hugepages,
@@ -907,6 +913,19 @@ impl MemoryManager {
                         existing_memory_files.remove(&guest_ram_mapping.slot),
                         thp,
                     )?;
+                    if mmap_prefault {
+                        let page_size = Self::get_prefault_align_size(
+                            &backing_file,
+                            zone_config.hugepages,
+                            zone_config.hugepage_size,
+                        )? as usize;
+                        Self::prefault_region(
+                            region.as_ptr(),
+                            guest_ram_mapping.size as usize,
+                            page_size,
+                            libc::MADV_POPULATE_READ,
+                        )?;
+                    }
                     memory_regions.push(Arc::clone(&region));
                     if let Some(memory_zone) = memory_zones.get_mut(&guest_ram_mapping.zone_id) {
                         if guest_ram_mapping.virtio_mem {
@@ -1986,7 +2005,7 @@ impl MemoryManager {
             shared: config.shared,
             hugepages: config.hugepages,
             hugepage_size: config.hugepage_size,
-            prefault: config.prefault,
+            prefault: prefault.unwrap_or(config.prefault),
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
@@ -2035,6 +2054,7 @@ impl MemoryManager {
                 None
             };
 
+            let create_regions_started = time::Instant::now();
             let mm = {
                 trace_scoped!("restore.memory.create_regions");
                 MemoryManager::new_internal(
@@ -2049,6 +2069,20 @@ impl MemoryManager {
                     mmap_restore_source.as_ref(),
                 )?
             };
+            let create_regions_us = create_regions_started.elapsed().as_micros();
+            warn!(
+                target: "ch_timing",
+                "ch_timing event=ch_host_memory_prefault requested={} memory_restore_mode={:?} bytes={} create_regions_us={} total_us={}",
+                prefault,
+                memory_restore_mode,
+                mem_snapshot
+                    .guest_ram_mappings
+                    .iter()
+                    .map(|mapping| mapping.size)
+                    .sum::<u64>(),
+                create_regions_us,
+                create_regions_us,
+            );
 
             match memory_restore_mode {
                 MemoryRestoreMode::Copy => {
@@ -2251,57 +2285,7 @@ impl MemoryManager {
         if prefault {
             let page_size =
                 Self::get_prefault_align_size(backing_file, hugepages, hugepage_size)? as usize;
-
-            if !is_aligned(size, page_size) {
-                warn!("Prefaulting memory size {size} misaligned with page size {page_size}");
-            }
-
-            let num_pages = size / page_size;
-
-            let num_threads = Self::get_prefault_num_threads(page_size, num_pages);
-
-            let pages_per_thread = num_pages / num_threads;
-            let remainder = num_pages % num_threads;
-
-            let barrier = Arc::new(Barrier::new(num_threads));
-            thread::scope(|s| -> Result<(), Error> {
-                let r = &region;
-                let mut handles = Vec::new();
-                for i in 0..num_threads {
-                    let barrier = Arc::clone(&barrier);
-                    let handle = s.spawn(move || {
-                        // Wait until all threads have been spawned to avoid contention
-                        // over mmap_sem between thread stack allocation and page faulting.
-                        barrier.wait();
-                        let pages = pages_per_thread + if i < remainder { 1 } else { 0 };
-                        let offset = page_size * ((i * pages_per_thread) + cmp::min(i, remainder));
-                        // SAFETY: FFI call with correct arguments
-                        let ret = unsafe {
-                            let addr = r.as_ptr().add(offset);
-                            libc::madvise(addr.cast(), pages * page_size, libc::MADV_POPULATE_WRITE)
-                        };
-                        if ret != 0 {
-                            let e = io::Error::last_os_error();
-                            return Err(e);
-                        }
-                        Ok(())
-                    });
-                    handles.push(handle);
-                }
-
-                for handle in handles {
-                    handle
-                        .join()
-                        .map_err(|e| {
-                            Error::PrefaultMemory(io::Error::other(format!(
-                                "Prefault thread panicked: {e:?}"
-                            )))
-                        })?
-                        .map_err(Error::PrefaultMemory)?;
-                }
-
-                Ok(())
-            })?;
+            Self::prefault_region(region.as_ptr(), size, page_size, libc::MADV_POPULATE_WRITE)?;
         }
 
         info!(
@@ -2322,6 +2306,66 @@ impl MemoryManager {
         }
 
         Ok(region)
+    }
+
+    fn prefault_region(
+        address: *mut u8,
+        size: usize,
+        page_size: usize,
+        advice: libc::c_int,
+    ) -> Result<(), Error> {
+        if !is_aligned(size, page_size) {
+            warn!("Prefaulting memory size {size} misaligned with page size {page_size}");
+        }
+
+        let num_pages = size / page_size;
+        let num_threads = Self::get_prefault_num_threads(page_size, num_pages);
+        let pages_per_thread = num_pages / num_threads;
+        let remainder = num_pages % num_threads;
+        let base = address as usize;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        thread::scope(|scope| -> Result<(), Error> {
+            let mut handles = Vec::new();
+            for i in 0..num_threads {
+                let barrier = Arc::clone(&barrier);
+                let handle = scope.spawn(move || {
+                    // Wait until all threads have been spawned to avoid contention
+                    // over mmap_sem between thread stack allocation and page faulting.
+                    barrier.wait();
+                    let pages = pages_per_thread + usize::from(i < remainder);
+                    let offset = page_size * ((i * pages_per_thread) + cmp::min(i, remainder));
+                    // SAFETY: the caller owns one mapped region covering
+                    // `[base, base + size)` for the lifetime of this scope;
+                    // each worker receives a non-overlapping page range.
+                    let ret = unsafe {
+                        libc::madvise(
+                            (base + offset) as *mut libc::c_void,
+                            pages * page_size,
+                            advice,
+                        )
+                    };
+                    if ret != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|error| {
+                        Error::PrefaultMemory(io::Error::other(format!(
+                            "Prefault thread panicked: {error:?}"
+                        )))
+                    })?
+                    .map_err(Error::PrefaultMemory)?;
+            }
+
+            Ok(())
+        })
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -2544,6 +2588,14 @@ impl MemoryManager {
 
     pub fn boot_guest_memory(&self) -> GuestMemoryMmap {
         self.boot_guest_memory.clone()
+    }
+
+    /// Guest-physical RAM ranges registered as KVM memory slots.
+    pub fn guest_ram_ranges(&self) -> Vec<(u64, u64)> {
+        self.guest_ram_mappings
+            .iter()
+            .map(|mapping| (mapping.gpa, mapping.size))
+            .collect()
     }
 
     pub fn allocator(&self) -> Arc<Mutex<SystemAllocator>> {
