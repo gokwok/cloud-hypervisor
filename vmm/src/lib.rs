@@ -1332,7 +1332,6 @@ impl Vmm {
                 self.console_resize_pipe.clone(),
                 Arc::clone(&self.original_termios_opt),
                 Some(&snapshot),
-                false,
                 #[cfg(feature = "igvm")]
                 None,
             )

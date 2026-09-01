@@ -365,11 +365,6 @@ pub enum HypervisorCpuError {
     GetNestedState(#[source] anyhow::Error),
     #[error("Failed to set nested guest state")]
     SetNestedState(#[source] anyhow::Error),
-    ///
-    /// Error prefaulting guest memory into the second-stage page tables
-    ///
-    #[error("Failed to prefault guest memory")]
-    PreFaultMemory(#[source] anyhow::Error),
 }
 
 #[derive(Debug)]
@@ -471,14 +466,6 @@ pub trait Vcpu: Send + Sync {
     /// Sets the vcpu's current "multiprocessing state".
     ///
     fn set_mp_state(&self, mp_state: MpState) -> Result<()>;
-    ///
-    /// Populate second-stage mappings for a guest-physical memory range.
-    ///
-    /// Returns `false` when the hypervisor does not support explicit
-    /// prefaulting. The default keeps non-KVM hypervisors compatible.
-    fn prefault_memory(&self, _gpa: u64, _size: u64) -> Result<bool> {
-        Ok(false)
-    }
     #[cfg(target_arch = "x86_64")]
     ///
     /// Let the guest know that it has been paused, which prevents from

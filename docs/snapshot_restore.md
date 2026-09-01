@@ -137,17 +137,12 @@ Current constraints for `memory_restore_mode=ondemand`:
 
 Current constraints for `memory_restore_mode=mmap`:
 
+- `prefault=on` is not supported
 - shared or huge page backed guest memory is not supported
 - every guest RAM mapping must have one complete snapshot range
 - the snapshot file and range offsets must be page-aligned
 - the regular file length or block device capacity must exactly match the
   snapshot ranges
-
-With `prefault=on`, mmap restore populates the private mapping for reads without
-breaking copy-on-write. On KVM hosts that provide `KVM_PRE_FAULT_MEMORY`, Cloud
-Hypervisor also builds the second-stage mappings before restored vCPUs resume.
-Hosts without that ioctl retain the host prefault and fall back to lazy
-second-stage faults.
 
 ## Restore a VM with new Net FDs
 For a VM created with FDs explicitly passed to NetConfig, a set of valid FDs
