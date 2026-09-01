@@ -9,9 +9,10 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, RwLock};
 use std::time::{Instant, SystemTime};
 use std::{fs, io, result};
@@ -24,9 +25,9 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
-use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
+use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vm_virtio::AccessPlatform;
+use vm_virtio::{AccessPlatform, Translatable, clone_queue};
 use vmm_sys_util::eventfd::EventFd;
 
 /// This is the `VirtioDevice` implementation for our vsock device. It handles the virtio-level
@@ -53,15 +54,17 @@ use super::{VsockBackend, VsockPacket};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
 use crate::{
-    ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
-    Error as DeviceError, GuestMemoryMmap, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
-    VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
-    VirtioInterruptType,
+    ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
+    EpollHelperHandler, Error as DeviceError, GuestMemoryMmap, VIRTIO_F_ACCESS_PLATFORM,
+    VIRTIO_F_IN_ORDER, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType,
+    VirtioInterrupt, VirtioInterruptType,
 };
 
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 3;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
+const EVT_QUEUE_INDEX: usize = 2;
+const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
 
 // New descriptors are pending on the rx queue.
 pub const RX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
@@ -105,6 +108,7 @@ pub struct VsockEpollHandler<B: VsockBackend> {
     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
     pub backend: Arc<RwLock<B>>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
+    pub transport_reset_pending: Arc<AtomicBool>,
     pub(crate) request_timings: HashMap<(u32, u32), VsockRequestTiming>,
 }
 
@@ -200,6 +204,10 @@ where
     ///
     fn process_rx(&mut self) -> result::Result<bool, Error> {
         debug!("vsock: epoll_handler::process_rx()");
+
+        if self.transport_reset_pending.load(Ordering::Acquire) {
+            return Ok(false);
+        }
 
         let mut used_descs = false;
 
@@ -299,42 +307,41 @@ where
             }
 
             if let Some((response_at, response_unix_us, response_mono_raw_us)) = response_timestamp
+                && let Some(timing) = self.request_timings.remove(&response_key)
             {
-                if let Some(timing) = self.request_timings.remove(&response_key) {
-                    let kick_at = timing.kick_at.unwrap_or(timing.request_committed_at);
-                    let kick_unix_us = timing
-                        .kick_unix_us
-                        .unwrap_or(timing.request_committed_unix_us);
-                    let kick_mono_raw_us = timing
-                        .kick_mono_raw_us
-                        .unwrap_or(timing.request_committed_mono_raw_us);
-                    let tx_event_at = timing.tx_event_at.unwrap_or(response_at);
-                    let tx_event_unix_us = timing.tx_event_unix_us.unwrap_or(response_unix_us);
-                    let tx_event_mono_raw_us =
-                        timing.tx_event_mono_raw_us.unwrap_or(response_mono_raw_us);
-                    warn!(
-                        target: "ch_timing",
-                        "ch_timing event=ch_vsock_guest_response local_port={} peer_port={} request_committed_unix_us={} request_committed_mono_raw_us={} kick_unix_us={} kick_mono_raw_us={} tx_event_unix_us={} tx_event_mono_raw_us={} response_unix_us={} response_mono_raw_us={} commit_to_kick_us={} kick_to_tx_event_us={} tx_event_to_response_us={} kick_to_response_us={}",
-                        response_key.0,
-                        response_key.1,
-                        timing.request_committed_unix_us,
-                        timing.request_committed_mono_raw_us,
-                        kick_unix_us,
-                        kick_mono_raw_us,
-                        tx_event_unix_us,
-                        tx_event_mono_raw_us,
-                        response_unix_us,
-                        response_mono_raw_us,
-                        kick_at
-                            .saturating_duration_since(timing.request_committed_at)
-                            .as_micros(),
-                        tx_event_at.saturating_duration_since(kick_at).as_micros(),
-                        response_at
-                            .saturating_duration_since(tx_event_at)
-                            .as_micros(),
-                        response_at.saturating_duration_since(kick_at).as_micros(),
-                    );
-                }
+                let kick_at = timing.kick_at.unwrap_or(timing.request_committed_at);
+                let kick_unix_us = timing
+                    .kick_unix_us
+                    .unwrap_or(timing.request_committed_unix_us);
+                let kick_mono_raw_us = timing
+                    .kick_mono_raw_us
+                    .unwrap_or(timing.request_committed_mono_raw_us);
+                let tx_event_at = timing.tx_event_at.unwrap_or(response_at);
+                let tx_event_unix_us = timing.tx_event_unix_us.unwrap_or(response_unix_us);
+                let tx_event_mono_raw_us =
+                    timing.tx_event_mono_raw_us.unwrap_or(response_mono_raw_us);
+                warn!(
+                    target: "ch_timing",
+                    "ch_timing event=ch_vsock_guest_response local_port={} peer_port={} request_committed_unix_us={} request_committed_mono_raw_us={} kick_unix_us={} kick_mono_raw_us={} tx_event_unix_us={} tx_event_mono_raw_us={} response_unix_us={} response_mono_raw_us={} commit_to_kick_us={} kick_to_tx_event_us={} tx_event_to_response_us={} kick_to_response_us={}",
+                    response_key.0,
+                    response_key.1,
+                    timing.request_committed_unix_us,
+                    timing.request_committed_mono_raw_us,
+                    kick_unix_us,
+                    kick_mono_raw_us,
+                    tx_event_unix_us,
+                    tx_event_mono_raw_us,
+                    response_unix_us,
+                    response_mono_raw_us,
+                    kick_at
+                        .saturating_duration_since(timing.request_committed_at)
+                        .as_micros(),
+                    tx_event_at.saturating_duration_since(kick_at).as_micros(),
+                    response_at
+                        .saturating_duration_since(tx_event_at)
+                        .as_micros(),
+                    response_at.saturating_duration_since(kick_at).as_micros(),
+                );
             }
 
             self.queues[1]
@@ -445,9 +452,38 @@ where
             }
             EVT_QUEUE_EVENT => {
                 debug!("vsock: EVT queue event");
-                self.queue_evts[2].read().map_err(|e| {
-                    EpollHelperError::HandleEvent(anyhow!("Failed to get EVT queue event: {e:?}"))
-                })?;
+                let kick_seen = match self.queue_evts[EVT_QUEUE_INDEX].read() {
+                    Ok(_) => true,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => false,
+                    Err(err) => {
+                        return Err(EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to get EVT queue event: {err:?}"
+                        )));
+                    }
+                };
+                if kick_seen && self.transport_reset_pending.swap(false, Ordering::AcqRel) {
+                    warn!(
+                        target: "ch_timing",
+                        "ch_timing event=ch_vsock_transport_reset_ack ack_unix_us={} ack_mono_raw_us={}",
+                        unix_time_us(),
+                        monotonic_raw_time_us(),
+                    );
+                    info!("vsock: guest acknowledged transport reset");
+                    if self.backend.read().unwrap().has_pending_rx() {
+                        let needs_notification = self.process_rx().map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Failed to process RX queue after transport reset: {e:?}"
+                            ))
+                        })?;
+                        if needs_notification {
+                            self.signal_used_queue(0).map_err(|e| {
+                                EpollHelperError::HandleEvent(anyhow!(
+                                    "Failed to signal used RX queue after transport reset: {e:?}"
+                                ))
+                            })?;
+                        }
+                    }
+                }
             }
             BACKEND_EVENT => {
                 debug!("vsock: backend event");
@@ -492,6 +528,12 @@ where
 }
 
 /// Virtio device exposing virtual socket to the guest.
+struct VsockTransportResetRuntime {
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    event_queue: Queue,
+    event_queue_evt: EventFd,
+}
+
 pub struct Vsock<B: VsockBackend> {
     common: VirtioCommon,
     id: String,
@@ -500,6 +542,8 @@ pub struct Vsock<B: VsockBackend> {
     path: PathBuf,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
+    transport_reset_pending: Arc<AtomicBool>,
+    transport_reset_runtime: Option<VsockTransportResetRuntime>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -508,6 +552,8 @@ pub struct VsockState {
     pub acked_features: u64,
     #[serde(default)]
     pub connections: Vec<(u32, u32)>,
+    #[serde(default)]
+    pub transport_reset_pending: bool,
 }
 
 impl<B> Vsock<B>
@@ -527,20 +573,26 @@ where
         exit_evt: EventFd,
         state: Option<VsockState>,
     ) -> io::Result<Vsock<B>> {
-        let (avail_features, acked_features, paused) = if let Some(state) = state {
-            info!("Restoring virtio-vsock {id}");
-            // Instead of letting the guest connection hang/timeout, proactively let
-            // the guest know the connection is gone.
-            backend.queue_rst_for_connections(state.connections.clone());
-            (state.avail_features, state.acked_features, true)
-        } else {
-            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
+        let (avail_features, acked_features, paused, transport_reset_pending) =
+            if let Some(state) = state {
+                info!("Restoring virtio-vsock {id}");
+                // Instead of letting the guest connection hang/timeout, proactively let
+                // the guest know the connection is gone.
+                backend.queue_rst_for_connections(state.connections.clone());
+                (
+                    state.avail_features,
+                    state.acked_features,
+                    true,
+                    state.transport_reset_pending,
+                )
+            } else {
+                let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
 
-            if access_platform_enabled {
-                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
-            }
-            (avail_features, 0, false)
-        };
+                if access_platform_enabled {
+                    avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+                }
+                (avail_features, 0, false, false)
+            };
 
         Ok(Vsock {
             common: VirtioCommon {
@@ -559,7 +611,71 @@ where
             path,
             seccomp_action,
             exit_evt,
+            transport_reset_pending: Arc::new(AtomicBool::new(transport_reset_pending)),
+            transport_reset_runtime: None,
         })
+    }
+
+    fn stage_transport_reset_event(&mut self) -> result::Result<(), anyhow::Error> {
+        if self.transport_reset_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let Some(runtime) = self.transport_reset_runtime.as_mut() else {
+            return Ok(());
+        };
+
+        match runtime.event_queue_evt.read() {
+            Ok(_) => debug!("vsock: drained event queue kick before transport reset"),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => {
+                return Err(anyhow!(
+                    "Failed to drain vsock event queue before transport reset: {err:?}"
+                ));
+            }
+        }
+
+        let queue = &mut runtime.event_queue;
+        let mut desc_chain = queue
+            .pop_descriptor_chain(runtime.mem.memory())
+            .ok_or_else(|| anyhow!("Vsock event queue has no available descriptor"))?;
+        let desc = desc_chain
+            .next()
+            .ok_or_else(|| anyhow!("Vsock event descriptor chain is empty"))?;
+
+        if !desc.is_write_only() || desc.len() < size_of::<u32>() as u32 {
+            return Err(anyhow!(
+                "Invalid vsock event descriptor: write_only={}, len={}",
+                desc.is_write_only(),
+                desc.len()
+            ));
+        }
+
+        let addr = desc
+            .addr()
+            .translate_gva(self.common.access_platform.as_deref(), size_of::<u32>())
+            .map_err(|err| anyhow!("Failed to translate vsock event descriptor: {err:?}"))?;
+        desc_chain
+            .memory()
+            .write_obj(VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le(), addr)
+            .map_err(|err| anyhow!("Failed to write vsock transport reset event: {err:?}"))?;
+        queue
+            .add_used(
+                desc_chain.memory(),
+                desc_chain.head_index(),
+                size_of::<u32>() as u32,
+            )
+            .map_err(|err| anyhow!("Failed to publish vsock transport reset event: {err:?}"))?;
+
+        self.transport_reset_pending.store(true, Ordering::Release);
+        if let Some(interrupt_cb) = &self.common.interrupt_cb
+            && let Err(err) =
+                interrupt_cb.trigger(VirtioInterruptType::Queue(EVT_QUEUE_INDEX as u16))
+        {
+            warn!("Failed to signal staged vsock transport reset event: {err:?}");
+        }
+        info!("vsock: transport reset staged; waiting for guest acknowledgement");
+        Ok(())
     }
 
     fn state(&self) -> VsockState {
@@ -567,6 +683,7 @@ where
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
             connections: self.backend.read().unwrap().connections(),
+            transport_reset_pending: self.transport_reset_pending.load(Ordering::Acquire),
         }
     }
 
@@ -628,6 +745,20 @@ where
             queue_evts.push(queue_evt);
         }
 
+        let event_queue = virtqueues.get(EVT_QUEUE_INDEX).ok_or_else(|| {
+            error!("virtio-vsock event queue is missing during activation");
+            ActivateError::BadActivate
+        })?;
+        let event_queue_evt = queue_evts[EVT_QUEUE_INDEX].try_clone().map_err(|err| {
+            error!("failed to clone virtio-vsock event queue eventfd: {err}");
+            ActivateError::BadActivate
+        })?;
+        self.transport_reset_runtime = Some(VsockTransportResetRuntime {
+            mem: mem.clone(),
+            event_queue: clone_queue(event_queue),
+            event_queue_evt,
+        });
+
         let mut handler = VsockEpollHandler {
             mem,
             queues: virtqueues,
@@ -637,8 +768,27 @@ where
             interrupt_cb: interrupt_cb.clone(),
             backend: self.backend.clone(),
             access_platform: self.common.access_platform(),
+            transport_reset_pending: self.transport_reset_pending.clone(),
             request_timings: HashMap::new(),
         };
+
+        if self.transport_reset_pending.load(Ordering::Acquire) {
+            handler
+                .signal_used_queue(EVT_QUEUE_INDEX as u16)
+                .map_err(|err| {
+                    error!("Failed to signal restored virtio-vsock transport reset: {err:#}");
+                    ActivateError::BadActivate
+                })?;
+            warn!(
+                target: "ch_timing",
+                "ch_timing event=ch_vsock_transport_reset_resignal signal_unix_us={} signal_mono_raw_us={}",
+                unix_time_us(),
+                monotonic_raw_time_us(),
+            );
+            info!(
+                "vsock: restored transport reset re-signalled; waiting for guest acknowledgement"
+            );
+        }
 
         let paused = self.common.paused.clone();
         let paused_sync = self.common.paused_sync.clone();
@@ -659,6 +809,8 @@ where
 
     fn reset(&mut self) {
         self.common.reset();
+        self.transport_reset_runtime = None;
+        self.transport_reset_pending.store(false, Ordering::Release);
         event!("virtio-device", "reset", "id", &self.id);
     }
 
@@ -697,6 +849,11 @@ where
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        self.stage_transport_reset_event().map_err(|err| {
+            MigratableError::Snapshot(anyhow!(
+                "Failed to stage vsock transport reset before snapshot: {err:#}"
+            ))
+        })?;
         Snapshot::new_from_state(&self.state())
     }
 }
@@ -705,11 +862,12 @@ impl<B> Migratable for Vsock<B> where B: VsockBackend + Sync + 'static {}
 
 #[cfg(test)]
 mod unit_tests {
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     use libc::EFD_NONBLOCK;
+    use virtio_bindings::virtio_ring::VRING_DESC_F_WRITE;
 
-    use super::super::unit_tests::{NoopVirtioInterrupt, TestContext};
+    use super::super::unit_tests::{NoopVirtioInterrupt, TestBackend, TestContext};
     use super::super::*;
     use super::*;
     use crate::ActivateError;
@@ -810,6 +968,149 @@ mod unit_tests {
                 device_status: Arc::new(AtomicU8::new(0)),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_vsock_state_preserves_pending_transport_reset() {
+        let ctx = TestContext::new();
+        ctx.device
+            .transport_reset_pending
+            .store(true, Ordering::Release);
+
+        let state = ctx.device.state();
+        assert!(state.transport_reset_pending);
+
+        let restored = Vsock::new(
+            String::from("restored-vsock"),
+            ctx.cid as u32,
+            PathBuf::from("/test/restored-vsock"),
+            TestBackend::new(),
+            false,
+            seccompiler::SeccompAction::Trap,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Some(state),
+        )
+        .unwrap();
+        assert!(restored.transport_reset_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_restore_pending_transport_reset_with_empty_event_queue() {
+        let ctx = TestContext::new();
+        let mut state = ctx.device.state();
+        state.transport_reset_pending = true;
+
+        let mut restored = Vsock::new(
+            String::from("restored-vsock"),
+            ctx.cid as u32,
+            PathBuf::from("/test/restored-vsock-empty-event-queue"),
+            TestBackend::new(),
+            false,
+            seccompiler::SeccompAction::Trap,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Some(state),
+        )
+        .unwrap();
+
+        restored
+            .activate(ActivationContext {
+                mem: GuestMemoryAtomic::new(ctx.mem.clone()),
+                interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
+                queues: vec![
+                    (
+                        0,
+                        Queue::new(256).unwrap(),
+                        EventFd::new(EFD_NONBLOCK).unwrap(),
+                    ),
+                    (
+                        1,
+                        Queue::new(256).unwrap(),
+                        EventFd::new(EFD_NONBLOCK).unwrap(),
+                    ),
+                    (
+                        2,
+                        Queue::new(256).unwrap(),
+                        EventFd::new(EFD_NONBLOCK).unwrap(),
+                    ),
+                ],
+                device_status: Arc::new(AtomicU8::new(0)),
+            })
+            .unwrap();
+
+        assert!(restored.transport_reset_pending.load(Ordering::Acquire));
+        restored.reset();
+        assert!(!restored.transport_reset_pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_snapshot_transport_reset_gates_rx_until_guest_ack() {
+        const EVENT_ADDR: u64 = 0x0060_0000;
+
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_epoll_handler_context();
+        ctx.guest_evvq.dtable[0].set(
+            EVENT_ADDR,
+            size_of::<u32>() as u32,
+            VRING_DESC_F_WRITE.try_into().unwrap(),
+            0,
+        );
+        ctx.guest_evvq.avail.ring[0].set(0);
+        ctx.guest_evvq.avail.idx.set(1);
+        test_ctx
+            .mem
+            .write_obj(u32::MAX, vm_memory::GuestAddress(EVENT_ADDR))
+            .unwrap();
+
+        let mut device = Vsock::new(
+            String::from("snapshot-vsock"),
+            test_ctx.cid as u32,
+            PathBuf::from("/test/snapshot-vsock"),
+            TestBackend::new(),
+            false,
+            seccompiler::SeccompAction::Trap,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            None,
+        )
+        .unwrap();
+        device.transport_reset_pending = ctx.handler.transport_reset_pending.clone();
+        device.transport_reset_runtime = Some(VsockTransportResetRuntime {
+            mem: GuestMemoryAtomic::new(test_ctx.mem.clone()),
+            event_queue: clone_queue(&ctx.handler.queues[EVT_QUEUE_INDEX]),
+            event_queue_evt: ctx.handler.queue_evts[EVT_QUEUE_INDEX].try_clone().unwrap(),
+        });
+
+        ctx.handler.queue_evts[EVT_QUEUE_INDEX].write(1).unwrap();
+        device.pause().unwrap();
+        assert!(!device.transport_reset_pending.load(Ordering::Acquire));
+        device.snapshot().unwrap();
+
+        assert!(ctx.handler.transport_reset_pending.load(Ordering::Acquire));
+        assert_eq!(ctx.guest_evvq.used.idx.get(), 1);
+        assert_eq!(
+            test_ctx
+                .mem
+                .read_obj::<u32>(vm_memory::GuestAddress(EVENT_ADDR))
+                .unwrap(),
+            VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+        );
+
+        let stale_event = epoll::Event::new(epoll::Events::EPOLLIN, EVT_QUEUE_EVENT as u64);
+        let mut epoll_helper =
+            EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
+        ctx.handler
+            .handle_event(&mut epoll_helper, &stale_event)
+            .unwrap();
+        assert!(ctx.handler.transport_reset_pending.load(Ordering::Acquire));
+
+        ctx.handler.backend.write().unwrap().set_pending_rx(true);
+        assert!(!ctx.handler.process_rx().unwrap());
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
+        assert_eq!(ctx.handler.backend.read().unwrap().rx_ok_cnt, 0);
+
+        ctx.signal_evtq_event();
+        assert!(!ctx.handler.transport_reset_pending.load(Ordering::Acquire));
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
+        assert_eq!(ctx.handler.backend.read().unwrap().rx_ok_cnt, 1);
     }
 
     #[test]
@@ -995,7 +1296,8 @@ mod unit_tests {
 
             ctx.handler
                 .handle_event(&mut epoll_helper, &event)
-                .expect_err("handle_event() should have failed");
+                .expect("a drained stale event queue notification is a no-op");
+            assert!(!ctx.handler.transport_reset_pending.load(Ordering::Acquire));
         }
     }
 

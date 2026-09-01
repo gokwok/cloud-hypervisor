@@ -159,9 +159,11 @@ pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
 
 #[cfg(any(test, fuzzing))]
 pub mod unit_tests {
+    use std::collections::HashMap;
     use std::io;
     use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, RwLock};
 
     use libc::EFD_NONBLOCK;
@@ -170,7 +172,7 @@ pub mod unit_tests {
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EventFd;
 
-    use super::device::{RX_QUEUE_EVENT, TX_QUEUE_EVENT, VsockEpollHandler};
+    use super::device::{EVT_QUEUE_EVENT, RX_QUEUE_EVENT, TX_QUEUE_EVENT, VsockEpollHandler};
     use super::packet::VSOCK_PKT_HDR_SIZE;
     use super::*;
     use crate::device::{VirtioInterrupt, VirtioInterruptType};
@@ -343,7 +345,8 @@ pub mod unit_tests {
                     interrupt_cb,
                     backend: Arc::new(RwLock::new(TestBackend::new())),
                     access_platform: None,
-                    request_timings: std::collections::HashMap::new(),
+                    transport_reset_pending: Arc::new(AtomicBool::new(false)),
+                    request_timings: HashMap::new(),
                 },
             }
         }
@@ -369,6 +372,14 @@ pub mod unit_tests {
             self.handler.queue_evts[0].write(1).unwrap();
             let events = epoll::Events::EPOLLIN;
             let event = epoll::Event::new(events, RX_QUEUE_EVENT as u64);
+            let mut epoll_helper =
+                EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
+            self.handler.handle_event(&mut epoll_helper, &event).ok();
+        }
+        pub fn signal_evtq_event(&mut self) {
+            self.handler.queue_evts[2].write(1).unwrap();
+            let events = epoll::Events::EPOLLIN;
+            let event = epoll::Event::new(events, EVT_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
             self.handler.handle_event(&mut epoll_helper, &event).ok();
