@@ -8,6 +8,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -104,7 +105,19 @@ pub struct VsockEpollHandler<B: VsockBackend> {
     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
     pub backend: Arc<RwLock<B>>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
-    pub(crate) rx_request_timing: Option<(Instant, u64)>,
+    pub(crate) request_timings: HashMap<(u32, u32), VsockRequestTiming>,
+}
+
+pub(crate) struct VsockRequestTiming {
+    request_committed_at: Instant,
+    request_committed_unix_us: u64,
+    request_committed_mono_raw_us: u64,
+    kick_at: Option<Instant>,
+    kick_unix_us: Option<u64>,
+    kick_mono_raw_us: Option<u64>,
+    tx_event_at: Option<Instant>,
+    tx_event_unix_us: Option<u64>,
+    tx_event_mono_raw_us: Option<u64>,
 }
 
 fn unix_time_us() -> u64 {
@@ -112,6 +125,22 @@ fn unix_time_us() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
         .unwrap_or_default()
+}
+
+fn monotonic_raw_time_us() -> u64 {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` points to writable memory for a `timespec`, and
+    // CLOCK_MONOTONIC_RAW does not require any additional preconditions.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut timestamp) } != 0 {
+        return 0;
+    }
+    u64::try_from(timestamp.tv_sec)
+        .unwrap_or_default()
+        .saturating_mul(1_000_000)
+        .saturating_add(u64::try_from(timestamp.tv_nsec).unwrap_or_default() / 1_000)
 }
 
 impl<B> VsockEpollHandler<B>
@@ -124,23 +153,44 @@ where
     fn signal_used_queue(&mut self, queue_index: u16) -> result::Result<(), DeviceError> {
         debug!("vsock: raising IRQ");
 
+        let irq_started_at = Instant::now();
+        let irq_started_unix_us = unix_time_us();
         self.interrupt_cb
             .trigger(VirtioInterruptType::Queue(queue_index))
             .map_err(|e| {
                 error!("Failed to signal used queue: {e:?}");
                 DeviceError::FailedSignalingUsedQueue(e)
             })?;
-        if queue_index == 0
-            && let Some((request_committed_at, request_committed_unix_us)) =
-                self.rx_request_timing.take()
-        {
-            warn!(
-                target: "ch_timing",
-                "ch_timing event=ch_vsock_guest_kick request_committed_unix_us={} kick_unix_us={} commit_to_kick_us={}",
-                request_committed_unix_us,
-                unix_time_us(),
-                request_committed_at.elapsed().as_micros(),
-            );
+        if queue_index == 0 {
+            let kick_at = Instant::now();
+            let kick_unix_us = unix_time_us();
+            let kick_mono_raw_us = monotonic_raw_time_us();
+            for ((local_port, peer_port), timing) in self.request_timings.iter_mut() {
+                if timing.kick_at.is_some() {
+                    continue;
+                }
+                timing.kick_at = Some(kick_at);
+                timing.kick_unix_us = Some(kick_unix_us);
+                timing.kick_mono_raw_us = Some(kick_mono_raw_us);
+                warn!(
+                    target: "ch_timing",
+                    "ch_timing event=ch_vsock_guest_kick local_port={} peer_port={} request_committed_unix_us={} request_committed_mono_raw_us={} irq_started_unix_us={} kick_unix_us={} kick_mono_raw_us={} commit_to_irq_us={} irq_trigger_us={} commit_to_kick_us={}",
+                    local_port,
+                    peer_port,
+                    timing.request_committed_unix_us,
+                    timing.request_committed_mono_raw_us,
+                    irq_started_unix_us,
+                    kick_unix_us,
+                    kick_mono_raw_us,
+                    irq_started_at
+                        .saturating_duration_since(timing.request_committed_at)
+                        .as_micros(),
+                    kick_at.saturating_duration_since(irq_started_at).as_micros(),
+                    kick_at
+                        .saturating_duration_since(timing.request_committed_at)
+                        .as_micros(),
+                );
+            }
         }
         Ok(())
     }
@@ -163,7 +213,20 @@ where
                         match pkt.commit_hdr(desc_chain.memory()) {
                             Ok(()) => {
                                 if pkt.op() == uapi::VSOCK_OP_REQUEST {
-                                    self.rx_request_timing = Some((Instant::now(), unix_time_us()));
+                                    self.request_timings.insert(
+                                        (pkt.src_port(), pkt.dst_port()),
+                                        VsockRequestTiming {
+                                            request_committed_at: Instant::now(),
+                                            request_committed_unix_us: unix_time_us(),
+                                            request_committed_mono_raw_us: monotonic_raw_time_us(),
+                                            kick_at: None,
+                                            kick_unix_us: None,
+                                            kick_mono_raw_us: None,
+                                            tx_event_at: None,
+                                            tx_event_unix_us: None,
+                                            tx_event_mono_raw_us: None,
+                                        },
+                                    );
                                 }
                                 pkt.hdr().len() as u32 + pkt.len()
                             }
@@ -221,9 +284,57 @@ where
                 }
             };
 
+            let response_key = (pkt.dst_port(), pkt.src_port());
+            let response_timestamp = if pkt.op() == uapi::VSOCK_OP_RESPONSE
+                && self.request_timings.contains_key(&response_key)
+            {
+                Some((Instant::now(), unix_time_us(), monotonic_raw_time_us()))
+            } else {
+                None
+            };
+
             if self.backend.write().unwrap().send_pkt(&pkt).is_err() {
                 self.queues[1].go_to_previous_position();
                 break;
+            }
+
+            if let Some((response_at, response_unix_us, response_mono_raw_us)) = response_timestamp
+            {
+                if let Some(timing) = self.request_timings.remove(&response_key) {
+                    let kick_at = timing.kick_at.unwrap_or(timing.request_committed_at);
+                    let kick_unix_us = timing
+                        .kick_unix_us
+                        .unwrap_or(timing.request_committed_unix_us);
+                    let kick_mono_raw_us = timing
+                        .kick_mono_raw_us
+                        .unwrap_or(timing.request_committed_mono_raw_us);
+                    let tx_event_at = timing.tx_event_at.unwrap_or(response_at);
+                    let tx_event_unix_us = timing.tx_event_unix_us.unwrap_or(response_unix_us);
+                    let tx_event_mono_raw_us =
+                        timing.tx_event_mono_raw_us.unwrap_or(response_mono_raw_us);
+                    warn!(
+                        target: "ch_timing",
+                        "ch_timing event=ch_vsock_guest_response local_port={} peer_port={} request_committed_unix_us={} request_committed_mono_raw_us={} kick_unix_us={} kick_mono_raw_us={} tx_event_unix_us={} tx_event_mono_raw_us={} response_unix_us={} response_mono_raw_us={} commit_to_kick_us={} kick_to_tx_event_us={} tx_event_to_response_us={} kick_to_response_us={}",
+                        response_key.0,
+                        response_key.1,
+                        timing.request_committed_unix_us,
+                        timing.request_committed_mono_raw_us,
+                        kick_unix_us,
+                        kick_mono_raw_us,
+                        tx_event_unix_us,
+                        tx_event_mono_raw_us,
+                        response_unix_us,
+                        response_mono_raw_us,
+                        kick_at
+                            .saturating_duration_since(timing.request_committed_at)
+                            .as_micros(),
+                        tx_event_at.saturating_duration_since(kick_at).as_micros(),
+                        response_at
+                            .saturating_duration_since(tx_event_at)
+                            .as_micros(),
+                        response_at.saturating_duration_since(kick_at).as_micros(),
+                    );
+                }
             }
 
             self.queues[1]
@@ -291,6 +402,16 @@ where
             }
             TX_QUEUE_EVENT => {
                 debug!("vsock: TX queue event");
+                let tx_event_at = Instant::now();
+                let tx_event_unix_us = unix_time_us();
+                let tx_event_mono_raw_us = monotonic_raw_time_us();
+                for timing in self.request_timings.values_mut() {
+                    if timing.kick_at.is_some() && timing.tx_event_at.is_none() {
+                        timing.tx_event_at = Some(tx_event_at);
+                        timing.tx_event_unix_us = Some(tx_event_unix_us);
+                        timing.tx_event_mono_raw_us = Some(tx_event_mono_raw_us);
+                    }
+                }
                 self.queue_evts[1].read().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get TX queue event: {e:?}"))
                 })?;
@@ -516,7 +637,7 @@ where
             interrupt_cb: interrupt_cb.clone(),
             backend: self.backend.clone(),
             access_platform: self.common.access_platform(),
-            rx_request_timing: None,
+            request_timings: HashMap::new(),
         };
 
         let paused = self.common.paused.clone();
