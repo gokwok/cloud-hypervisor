@@ -62,6 +62,52 @@ reviewable, and compatible with the project's normal engineering constraints.
   `devcli_testenv` or simply build through `clippy` which automatically includes
   these code paths; otherwise the integration-test code is not included.
 
+#### Maintained x86_64 musl release build
+
+- Build the release binary on `gw-ubuntu` in the pinned container image
+  `ghcr.io/cloud-hypervisor/cloud-hypervisor:20260522-0`; do not substitute a
+  different container tag for release artifacts.
+- Mount the `gw-ubuntu` stable Rust toolchain into the container. The image's
+  Rust 1.89 musl sysroot lacks `preadv2` and `pwritev2`, while the validated
+  stable toolchain supplies them. The image's distro `libcap-ng` is also
+  glibc-linked, so mount the verified musl build of libcap-ng 0.8.4 and select
+  it explicitly. From `/home/gokwok/code/work/cloud-hypervisor`, run:
+
+  ```sh
+  docker run --rm \
+    --volume "$PWD:/cloud-hypervisor" \
+    --volume /home/gokwok/.cargo/git:/usr/local/rust/git \
+    --volume /home/gokwok/.cargo/registry:/usr/local/rust/registry \
+    --volume /home/gokwok/.rustup/toolchains/stable-x86_64-unknown-linux-gnu:/opt/rust:ro \
+    --volume /home/gokwok/ch-staged-reset-ab/native/libcap-ng-0.8.4-musl:/opt/libcap-ng-musl:ro \
+    --workdir /cloud-hypervisor \
+    --env RUSTC=/opt/rust/bin/rustc \
+    --env RUSTDOC=/opt/rust/bin/rustdoc \
+    --env CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+    --env CC_x86_64_unknown_linux_musl=musl-gcc \
+    --env LIBCAPNG_LINK_TYPE=static \
+    --env LIBCAPNG_LIB_PATH=/opt/libcap-ng-musl/lib \
+    ghcr.io/cloud-hypervisor/cloud-hypervisor:20260522-0 \
+    sh -lc '
+      git config --global --add safe.directory /cloud-hypervisor &&
+      /opt/rust/bin/cargo clean --offline -p cloud-hypervisor --release \
+        --target x86_64-unknown-linux-musl &&
+      /opt/rust/bin/cargo rustc --locked --offline --release \
+        --target x86_64-unknown-linux-musl \
+        -p cloud-hypervisor --bin cloud-hypervisor -- \
+        -C link-arg=-Wl,--start-group \
+        -C link-arg=/opt/libcap-ng-musl/lib/libcap-ng.a \
+        -C link-arg=-lc \
+        -C link-arg=-Wl,--end-group
+    '
+  ```
+
+- The artifact is
+  `target/x86_64-unknown-linux-musl/release/cloud-hypervisor`. Before packaging,
+  verify its embedded version matches `git describe --dirty`, inspect it with
+  `file`, confirm `readelf -l` has no `INTERP` segment, and confirm
+  `readelf -d` has no `NEEDED` entries.
+
 ### Commit and Patch Formatting
 
 - Follow the rules in `CONTRIBUTING.md`, including reviewable commit structure,
