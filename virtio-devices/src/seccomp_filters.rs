@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use block::{BLKDISCARD, BLKZEROOUT};
 use libc::{FIONBIO, TIOCGWINSZ, TUNSETOFFLOAD};
@@ -14,7 +16,7 @@ use seccompiler::{
     SeccompFilter, SeccompRule,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Thread {
     VirtioBalloon,
     VirtioBlock,
@@ -34,6 +36,73 @@ pub enum Thread {
     VirtioVhostNetCtl,
     VirtioVsock,
     VirtioWatchdog,
+}
+
+impl Thread {
+    const ALL: [Self; 18] = [
+        Self::VirtioBalloon,
+        Self::VirtioBlock,
+        Self::VirtioConsole,
+        Self::VirtioIommu,
+        Self::VirtioMem,
+        Self::VirtioNet,
+        Self::VirtioNetCtl,
+        Self::VirtioPmem,
+        Self::VirtioRng,
+        Self::VirtioRtc,
+        Self::VirtioFs,
+        Self::VirtioVhostBlock,
+        Self::VirtioVhostFs,
+        Self::VirtioGenericVhostUser,
+        Self::VirtioVhostNet,
+        Self::VirtioVhostNetCtl,
+        Self::VirtioVsock,
+        Self::VirtioWatchdog,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::VirtioBalloon => "virtio-balloon",
+            Self::VirtioBlock => "virtio-block",
+            Self::VirtioConsole => "virtio-console",
+            Self::VirtioIommu => "virtio-iommu",
+            Self::VirtioMem => "virtio-mem",
+            Self::VirtioNet => "virtio-net",
+            Self::VirtioNetCtl => "virtio-net-ctl",
+            Self::VirtioPmem => "virtio-pmem",
+            Self::VirtioRng => "virtio-rng",
+            Self::VirtioRtc => "virtio-rtc",
+            Self::VirtioFs => "virtio-fs",
+            Self::VirtioVhostBlock => "virtio-vhost-block",
+            Self::VirtioVhostFs => "virtio-vhost-fs",
+            Self::VirtioGenericVhostUser => "virtio-generic-vhost-user",
+            Self::VirtioVhostNet => "virtio-vhost-net",
+            Self::VirtioVhostNetCtl => "virtio-vhost-net-ctl",
+            Self::VirtioVsock => "virtio-vsock",
+            Self::VirtioWatchdog => "virtio-watchdog",
+        }
+    }
+}
+
+struct CachedFilter {
+    action: SeccompAction,
+    thread: Thread,
+    program: Arc<BpfProgram>,
+}
+
+static FILTER_CACHE: OnceLock<Mutex<Vec<CachedFilter>>> = OnceLock::new();
+
+pub(crate) struct FilterLookup {
+    pub program: Arc<BpfProgram>,
+    pub cache_hit: bool,
+    pub build_us: u128,
+    pub lookup_us: u128,
+}
+
+pub struct PrecompileSummary {
+    pub filter_count: usize,
+    pub cache_hits: usize,
+    pub build_us: u128,
 }
 
 /// Shorthand for chaining `SeccompCondition`s with the `and` operator  in a `SeccompRule`.
@@ -457,8 +526,7 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
     ]
 }
 
-/// Generate a BPF program based on the seccomp_action value
-pub fn get_seccomp_filter(
+fn build_seccomp_filter(
     seccomp_action: &SeccompAction,
     thread_type: Thread,
 ) -> Result<BpfProgram, Error> {
@@ -472,5 +540,91 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+pub(crate) fn get_cached_seccomp_filter(
+    seccomp_action: &SeccompAction,
+    thread_type: Thread,
+) -> Result<FilterLookup, Error> {
+    let lookup_started = Instant::now();
+    let cache = FILTER_CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(Thread::ALL.len())));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache
+        .iter()
+        .find(|entry| entry.action == *seccomp_action && entry.thread == thread_type)
+    {
+        return Ok(FilterLookup {
+            program: entry.program.clone(),
+            cache_hit: true,
+            build_us: 0,
+            lookup_us: lookup_started.elapsed().as_micros(),
+        });
+    }
+
+    // Compile while holding the cache lock. Cache misses only occur during VMM
+    // initialization in normal operation, and serializing them prevents a
+    // concurrent restore from compiling the same program twice.
+    let build_started = Instant::now();
+    let program = Arc::new(build_seccomp_filter(seccomp_action, thread_type)?);
+    let build_us = build_started.elapsed().as_micros();
+    cache.push(CachedFilter {
+        action: seccomp_action.clone(),
+        thread: thread_type,
+        program: program.clone(),
+    });
+    Ok(FilterLookup {
+        program,
+        cache_hit: false,
+        build_us,
+        lookup_us: lookup_started.elapsed().as_micros(),
+    })
+}
+
+/// Compile every virtio worker filter while the VMM is still idle.
+pub fn precompile_seccomp_filters(
+    seccomp_action: &SeccompAction,
+) -> Result<PrecompileSummary, Error> {
+    let mut cache_hits = 0;
+    let mut build_us = 0;
+    for thread_type in Thread::ALL {
+        let lookup = get_cached_seccomp_filter(seccomp_action, thread_type)?;
+        cache_hits += usize::from(lookup.cache_hit);
+        build_us += lookup.build_us;
+    }
+    Ok(PrecompileSummary {
+        filter_count: Thread::ALL.len(),
+        cache_hits,
+        build_us,
+    })
+}
+
+/// Generate a BPF program based on the seccomp_action value.
+///
+/// Keep the existing public interface for callers outside this crate. Virtio
+/// worker creation uses the shared `Arc` path above to avoid copying the cached
+/// program.
+pub fn get_seccomp_filter(
+    seccomp_action: &SeccompAction,
+    thread_type: Thread,
+) -> Result<BpfProgram, Error> {
+    get_cached_seccomp_filter(seccomp_action, thread_type)
+        .map(|lookup| lookup.program.as_ref().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_filter_is_reused() {
+        let action = SeccompAction::Trap;
+        let first = get_cached_seccomp_filter(&action, Thread::VirtioWatchdog).unwrap();
+        let second = get_cached_seccomp_filter(&action, Thread::VirtioWatchdog).unwrap();
+
+        assert!(second.cache_hit);
+        assert!(Arc::ptr_eq(&first.program, &second.program));
     }
 }

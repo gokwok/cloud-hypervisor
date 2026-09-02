@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
+use virtio_devices::seccomp_filters::precompile_seccomp_filters;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::*;
@@ -876,6 +877,17 @@ impl Vmm {
         exit_evt: EventFd,
         no_shutdown: bool,
     ) -> Result<Self> {
+        let seccomp_precompile_started = Instant::now();
+        let seccomp_precompile =
+            precompile_seccomp_filters(&seccomp_action).map_err(Error::CreateSeccompFilter)?;
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_precompile_virtio_seccomp total_us={} filter_count={} cache_hits={} seccomp_filter_build_us={}",
+            seccomp_precompile_started.elapsed().as_micros(),
+            seccomp_precompile.filter_count,
+            seccomp_precompile.cache_hits,
+            seccomp_precompile.build_us,
+        );
         let precreated_vm = {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             {

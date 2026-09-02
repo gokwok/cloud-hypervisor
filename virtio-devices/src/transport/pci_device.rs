@@ -11,6 +11,7 @@ use std::io::Write;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::Instant;
 use std::{cmp, io, result};
 
 use anyhow::anyhow;
@@ -430,6 +431,9 @@ impl VirtioPciDevice {
         pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
         snapshot: Option<&Snapshot>,
     ) -> Result<Self> {
+        let restore_transport_started = Instant::now();
+        let restored = snapshot.is_some();
+        let queue_setup_started = Instant::now();
         let mut locked_device = device.lock().unwrap();
         let mut queue_evts = Vec::new();
         for _ in locked_device.queue_max_sizes().iter() {
@@ -455,7 +459,9 @@ impl VirtioPciDevice {
         // It also adds 1 as we need to take into account the dedicated vector to notify
         // about a virtio config change.
         let msix_num = (locked_device.queue_max_sizes().len() + 1) as u16;
+        let queue_setup_us = queue_setup_started.elapsed().as_micros();
 
+        let interrupt_group_started = Instant::now();
         let interrupt_source_group: MaybeMutInterruptSourceGroup = {
             let config = MsiIrqGroupConfig {
                 base: 0,
@@ -476,6 +482,8 @@ impl VirtioPciDevice {
                 ))
             })?
         };
+        let interrupt_group_create_us = interrupt_group_started.elapsed().as_micros();
+        let msix_started = Instant::now();
         let msix_state =
             vm_migration::state_from_id(snapshot, pci::MSIX_CONFIG_ID).map_err(|e| {
                 VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
@@ -493,7 +501,9 @@ impl VirtioPciDevice {
             let msix_config_clone = msix_config.clone();
             (msix_config, msix_config_clone)
         };
+        let msix_us = msix_started.elapsed().as_micros();
 
+        let pci_config_started = Instant::now();
         let (class, subclass) = match VirtioDeviceType::from(locked_device.device_type()) {
             VirtioDeviceType::Net => (
                 PciClassCode::NetworkController,
@@ -529,7 +539,9 @@ impl VirtioPciDevice {
             Some(msix_config_clone),
             pci_configuration_state,
         );
+        let pci_config_us = pci_config_started.elapsed().as_micros();
 
+        let common_config_started = Instant::now();
         let common_config_state =
             vm_migration::state_from_id(snapshot, VIRTIO_PCI_COMMON_CONFIG_ID).map_err(|e| {
                 VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
@@ -553,7 +565,9 @@ impl VirtioPciDevice {
                 device.clone(),
             )
         };
+        let common_config_us = common_config_started.elapsed().as_micros();
 
+        let queue_restore_started = Instant::now();
         let state: Option<VirtioPciDeviceState> = snapshot
             .as_ref()
             .map(|s| s.to_state())
@@ -603,6 +617,7 @@ impl VirtioPciDevice {
         } else {
             (false, 0, VirtioPciCfgCapInfo::default())
         };
+        let queue_restore_us = queue_restore_started.elapsed().as_micros();
 
         // Dropping the MutexGuard to unlock the VirtioDevice. This is required
         // in the context of a restore given the device might require some
@@ -610,6 +625,7 @@ impl VirtioPciDevice {
         // prevents from a subtle deadlock.
         drop(locked_device);
 
+        let assemble_started = Instant::now();
         let virtio_interrupt = Arc::new(VirtioInterruptMsix::new(
             msix_config.clone(),
             common_config.msix_config.clone(),
@@ -638,10 +654,12 @@ impl VirtioPciDevice {
             dma_handler,
             pending_activations,
         };
+        let assemble_us = assemble_started.elapsed().as_micros();
 
         // In case of a restore, we can activate the device, as we know at
         // this point the virtqueues are in the right state and the device is
         // ready to be activated, which will spawn each virtio worker thread.
+        let restore_activate_started = Instant::now();
         if virtio_pci_device.device_activated.load(Ordering::SeqCst)
             && virtio_pci_device.is_driver_ready()
         {
@@ -650,6 +668,24 @@ impl VirtioPciDevice {
                     "Failed activating the device: {e}"
                 ))
             })?;
+        }
+        let restore_activate_us = restore_activate_started.elapsed().as_micros();
+
+        if restored {
+            warn!(
+                target: "ch_timing",
+                "ch_timing event=ch_restore_virtio_pci_transport device={} queue_setup_us={} interrupt_group_create_us={} msix_us={} pci_config_us={} common_config_us={} queue_restore_us={} assemble_us={} restore_activate_us={} total_us={}",
+                virtio_pci_device.id,
+                queue_setup_us,
+                interrupt_group_create_us,
+                msix_us,
+                pci_config_us,
+                common_config_us,
+                queue_restore_us,
+                assemble_us,
+                restore_activate_us,
+                restore_transport_started.elapsed().as_micros(),
+            );
         }
 
         Ok(virtio_pci_device)
