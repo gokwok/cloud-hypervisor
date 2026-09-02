@@ -602,20 +602,26 @@ impl Vm {
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
+        let vm_components_started = Instant::now();
 
+        let phase_started = Instant::now();
         let boot_id_list = config
             .lock()
             .unwrap()
             .validate()
             .map_err(Error::ConfigValidation)?;
+        let config_validate_us = phase_started.elapsed().as_micros();
 
         info!("Booting VM from config: {config:?}");
 
         // Create NUMA nodes based on NumaConfig.
+        let phase_started = Instant::now();
         let numa_nodes =
             Self::create_numa_nodes(config.lock().unwrap().numa.as_deref(), &memory_manager)?;
+        let numa_us = phase_started.elapsed().as_micros();
 
         // Determine if VIRTIO_F_ACCESS_PLATFORM should be forced (e.g. for TDX/SEV-SNP)
+        let phase_started = Instant::now();
         let force_access_platform = Self::should_force_access_platform(&config);
 
         let stop_on_boot = Self::should_stop_on_boot(&config);
@@ -630,8 +636,10 @@ impl Vm {
             io_bus: io_bus.clone(),
             mmio_bus: mmio_bus.clone(),
         });
+        let vm_ops_us = phase_started.elapsed().as_micros();
 
         // Create CPU manager
+        let phase_started = Instant::now();
         let cpu_manager = {
             trace_scoped!("restore.cpu_manager");
             Self::create_cpu_manager(
@@ -647,12 +655,14 @@ impl Vm {
                 &numa_nodes,
             )?
         };
+        let cpu_manager_us = phase_started.elapsed().as_micros();
 
         // Perform hypervisor-specific TDX initialization if enabled
         #[cfg(feature = "tdx")]
         Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
 
         // Create device manager
+        let phase_started = Instant::now();
         let device_manager = {
             trace_scoped!("restore.device_manager");
             Self::create_device_manager(
@@ -675,8 +685,10 @@ impl Vm {
                 snapshot,
             )?
         };
+        let device_manager_us = phase_started.elapsed().as_micros();
 
         // Perform hypervisor-specific initialization
+        let phase_started = Instant::now();
         let load_payload_handle = {
             trace_scoped!("restore.hypervisor_init");
             Self::hypervisor_specific_init(
@@ -694,8 +706,10 @@ impl Vm {
                 igvm_file,
             )?
         };
+        let hypervisor_init_us = phase_started.elapsed().as_micros();
 
         // Load kernel and initramfs files
+        let phase_started = Instant::now();
         #[cfg(feature = "tdx")]
         let kernel = config
             .lock()
@@ -716,7 +730,9 @@ impl Vm {
             .unwrap_or_default()
             .transpose()
             .map_err(Error::InitramfsFile)?;
+        let payload_files_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         let saved_clock = if let Some(snapshot) = snapshot.as_ref() {
             let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
             // Restored or migrated in: the guest clock must catch up to wall time
@@ -728,6 +744,7 @@ impl Vm {
         } else {
             None
         };
+        let saved_clock_us = phase_started.elapsed().as_micros();
 
         let state = if snapshot.is_some() {
             VmState::Paused
@@ -735,7 +752,8 @@ impl Vm {
             VmState::Created
         };
 
-        Ok(Vm {
+        let phase_started = Instant::now();
+        let restored_vm = Vm {
             #[cfg(feature = "tdx")]
             kernel,
             initramfs,
@@ -753,7 +771,23 @@ impl Vm {
             hypervisor,
             stop_on_boot,
             load_payload_handle,
-        })
+        };
+        let assemble_us = phase_started.elapsed().as_micros();
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_vm_components config_validate_us={} numa_us={} vm_ops_us={} cpu_manager_us={} device_manager_us={} hypervisor_init_us={} payload_files_us={} saved_clock_us={} assemble_us={} total_us={}",
+            config_validate_us,
+            numa_us,
+            vm_ops_us,
+            cpu_manager_us,
+            device_manager_us,
+            hypervisor_init_us,
+            payload_files_us,
+            saved_clock_us,
+            assemble_us,
+            vm_components_started.elapsed().as_micros(),
+        );
+        Ok(restored_vm)
     }
 
     /// Determine if VIRTIO_F_ACCESS_PLATFORM should be forced based on
@@ -928,6 +962,7 @@ impl Vm {
         snapshot: Option<&Snapshot>,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
+        let hypervisor_init_started = Instant::now();
         #[cfg(feature = "mshv")]
         let is_mshv = matches!(
             hypervisor.hypervisor_type(),
@@ -979,13 +1014,16 @@ impl Vm {
         }
 
         // Allocate address space for non-SEV-SNP guests
+        let phase_started = Instant::now();
         memory_manager
             .lock()
             .unwrap()
             .allocate_address_space()
             .map_err(Error::MemoryManager)?;
+        let address_space_us = phase_started.elapsed().as_micros();
 
         // Load payload asynchronously
+        let phase_started = Instant::now();
         let load_payload_handle = if snapshot.is_none() {
             Self::load_payload_async(
                 memory_manager,
@@ -998,15 +1036,19 @@ impl Vm {
         } else {
             None
         };
+        let payload_start_us = phase_started.elapsed().as_micros();
 
         // Create boot vCPUs
+        let phase_started = Instant::now();
         cpu_manager
             .lock()
             .unwrap()
             .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
             .map_err(Error::CpuManager)?;
+        let create_vcpus_us = phase_started.elapsed().as_micros();
 
         // KVM-specific initialization
+        let phase_started = Instant::now();
         #[cfg(feature = "kvm")]
         if is_kvm {
             Self::init_kvm(
@@ -1018,10 +1060,24 @@ impl Vm {
                 snapshot,
             )?;
         }
+        let platform_init_us = phase_started.elapsed().as_micros();
 
         // Create fw_cfg device if configured
+        let phase_started = Instant::now();
         #[cfg(feature = "fw_cfg")]
         Self::create_fw_cfg_if_enabled(config, device_manager)?;
+        let fw_cfg_us = phase_started.elapsed().as_micros();
+
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_hypervisor_init address_space_us={} payload_start_us={} create_vcpus_us={} platform_init_us={} fw_cfg_us={} total_us={}",
+            address_space_us,
+            payload_start_us,
+            create_vcpus_us,
+            platform_init_us,
+            fw_cfg_us,
+            hypervisor_init_started.elapsed().as_micros(),
+        );
 
         Ok(load_payload_handle)
     }
@@ -1138,9 +1194,11 @@ impl Vm {
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
     ) -> Result<()> {
+        let kvm_init_started = Instant::now();
         // For KVM, create interrupt controller after boot vcpus
         // because GIC state is restored from snapshot during vcpu creation
         let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
+        let phase_started = Instant::now();
         let ic = {
             trace_scoped!("restore.kvm.interrupt_controller");
             device_manager
@@ -1149,12 +1207,16 @@ impl Vm {
                 .create_interrupt_controller(dm_snapshot)
                 .map_err(Error::DeviceManager)?
         };
+        let interrupt_controller_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.kvm.vm_init");
             vm.init().map_err(Error::InitializeVm)?;
         }
+        let vm_init_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.kvm.devices");
             device_manager
@@ -1169,6 +1231,16 @@ impl Vm {
                 )
                 .map_err(Error::DeviceManager)?;
         }
+        let devices_us = phase_started.elapsed().as_micros();
+
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_kvm_init interrupt_controller_us={} vm_init_us={} devices_us={} total_us={}",
+            interrupt_controller_us,
+            vm_init_us,
+            devices_us,
+            kvm_init_started.elapsed().as_micros(),
+        );
 
         Ok(())
     }
@@ -1386,6 +1458,7 @@ impl Vm {
         memory_restore_mode: Option<MemoryRestoreMode>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
+        let vm_new_started = Instant::now();
 
         #[cfg(not(target_arch = "riscv64"))]
         let timestamp = Instant::now();
@@ -1409,6 +1482,7 @@ impl Vm {
                 .map_err(Error::IgvmLoad)?
         };
 
+        let phase_started = Instant::now();
         let vm = {
             trace_scoped!("restore.create_hypervisor_vm");
             #[allow(unused_mut)]
@@ -1420,17 +1494,23 @@ impl Vm {
             }
             Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
         };
+        let create_hypervisor_vm_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         if vm_config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
             vm.enable_x2apic_api().unwrap();
         }
+        let x2apic_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         let phys_bits = physical_bits(
             hypervisor.as_ref(),
             vm_config.lock().unwrap().cpus.max_phys_bits,
         );
+        let physical_bits_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
                 trace_scoped!("restore.memory_manager");
@@ -1458,8 +1538,10 @@ impl Vm {
                 )
                 .map_err(Error::MemoryManager)?
             };
+        let memory_manager_us = phase_started.elapsed().as_micros();
 
-        {
+        let phase_started = Instant::now();
+        let restored_vm = {
             trace_scoped!("restore.vm_components");
             Vm::new_from_memory_manager(
                 vm_config,
@@ -1481,8 +1563,20 @@ impl Vm {
                 snapshot,
                 #[cfg(feature = "igvm")]
                 igvm_file,
-            )
-        }
+            )?
+        };
+        let vm_components_us = phase_started.elapsed().as_micros();
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_vm_new create_hypervisor_vm_us={} x2apic_us={} physical_bits_us={} memory_manager_us={} vm_components_us={} total_us={}",
+            create_hypervisor_vm_us,
+            x2apic_us,
+            physical_bits_us,
+            memory_manager_us,
+            vm_components_us,
+            vm_new_started.elapsed().as_micros(),
+        );
+        Ok(restored_vm)
     }
 
     pub fn create_hypervisor_vm(
@@ -2988,22 +3082,34 @@ impl Vm {
 
     pub fn restore(&mut self) -> Result<()> {
         event!("vm", "restoring");
+        let restore_started = Instant::now();
 
         // We acquire all advisory disk image locks again.
+        let phase_started = Instant::now();
         self.device_manager
             .lock()
             .unwrap()
             .try_lock_disks()
             .map_err(Error::LockingError)?;
+        let disk_locks_us = phase_started.elapsed().as_micros();
 
         // Now we can start all vCPUs from here.
+        let phase_started = Instant::now();
         self.cpu_manager
             .lock()
             .unwrap()
             .start_restored_vcpus()
             .map_err(Error::CpuManager)?;
+        let start_restored_vcpus_us = phase_started.elapsed().as_micros();
 
         event!("vm", "restored");
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_start_vcpus disk_locks_us={} start_restored_vcpus_us={} total_us={}",
+            disk_locks_us,
+            start_restored_vcpus_us,
+            restore_started.elapsed().as_micros(),
+        );
         Ok(())
     }
 

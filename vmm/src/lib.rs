@@ -1916,27 +1916,35 @@ impl Vmm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
+                let restore_vm_build_started = Instant::now();
                 let _trace = tracer::start_scoped();
                 trace_scoped!("restore.total");
+                let phase_started = Instant::now();
                 let snapshot = {
                     trace_scoped!("restore.receive_state");
                     recv_vm_state(source_url).map_err(VmError::Restore)?
                 };
+                let receive_state_us = phase_started.elapsed().as_micros();
+                let phase_started = Instant::now();
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
 
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 self.vm_check_cpuid_compatibility(&vm_config, &vm_snapshot.common_cpuid)
                     .map_err(VmError::Restore)?;
+                let cpuid_compatibility_us = phase_started.elapsed().as_micros();
 
                 self.vm_config = Some(Arc::clone(&vm_config));
 
                 // Always re-populate the 'console_info' based on the new 'vm_config'
+                let phase_started = Instant::now();
                 self.console_info = Some({
                     trace_scoped!("restore.pre_create_console");
                     pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?
                 });
+                let console_prepare_us = phase_started.elapsed().as_micros();
 
+                let phase_started = Instant::now();
                 let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
                 let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
                 let guest_exit_evt = self
@@ -1952,7 +1960,9 @@ impl Vmm {
                     .activate_evt
                     .try_clone()
                     .map_err(VmError::EventFdClone)?;
+                let eventfd_clone_us = phase_started.elapsed().as_micros();
 
+                let phase_started = Instant::now();
                 let mut vm = {
                     trace_scoped!("restore.vm_new");
                     Vm::new(
@@ -1974,7 +1984,9 @@ impl Vmm {
                         Some(memory_restore_mode),
                     )?
                 };
+                let vm_new_us = phase_started.elapsed().as_micros();
 
+                let phase_started = Instant::now();
                 if self
                     .vm_config
                     .as_ref()
@@ -1986,14 +1998,32 @@ impl Vmm {
                     let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
                     apply_landlock(&mut config).map_err(VmError::ApplyLandlock)?;
                 }
+                let landlock_us = phase_started.elapsed().as_micros();
 
                 // Now we can restore the rest of the VM.
                 // PANIC: won't panic, we just checked that the VM is there.
+                let phase_started = Instant::now();
                 {
                     trace_scoped!("restore.start_vcpus");
                     vm.restore()?;
                 }
+                let start_vcpus_us = phase_started.elapsed().as_micros();
+                let phase_started = Instant::now();
                 self.vm = VmOwnership::Owned(vm);
+                let publish_us = phase_started.elapsed().as_micros();
+                warn!(
+                    target: "ch_timing",
+                    "ch_timing event=ch_restore_vm_build_detail receive_state_us={} cpuid_compatibility_us={} console_prepare_us={} eventfd_clone_us={} vm_new_us={} landlock_us={} start_vcpus_us={} publish_us={} total_us={}",
+                    receive_state_us,
+                    cpuid_compatibility_us,
+                    console_prepare_us,
+                    eventfd_clone_us,
+                    vm_new_us,
+                    landlock_us,
+                    start_vcpus_us,
+                    publish_us,
+                    restore_vm_build_started.elapsed().as_micros(),
+                );
                 Ok(())
             }
         }

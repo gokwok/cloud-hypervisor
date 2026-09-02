@@ -2652,72 +2652,116 @@ impl DeviceManager {
     }
 
     fn make_virtio_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
+        let virtio_devices_started = Instant::now();
+
         // Create "standard" virtio devices (net/block/rng)
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.block");
             self.make_virtio_block_devices(snapshot)?;
         }
+        let block_us = phase_started.elapsed().as_micros();
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.net");
             self.make_virtio_net_devices(snapshot)?;
         }
+        let net_us = phase_started.elapsed().as_micros();
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.rng");
             self.make_virtio_rng_devices(snapshot)?;
         }
+        let rng_us = phase_started.elapsed().as_micros();
 
         // Add generic vhost-user if required
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.vhost_user");
             self.make_generic_vhost_user_devices(snapshot)?;
         }
+        let vhost_user_us = phase_started.elapsed().as_micros();
 
         // Add virtio-fs if required
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.fs");
             self.make_virtio_fs_devices(snapshot)?;
         }
+        let fs_us = phase_started.elapsed().as_micros();
 
         // Add virtio-pmem if required
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.pmem");
             self.make_virtio_pmem_devices(snapshot)?;
         }
+        let pmem_us = phase_started.elapsed().as_micros();
 
         // Add virtio-vsock if required
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.vsock");
             self.make_virtio_vsock_devices(snapshot)?;
         }
+        let vsock_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.mem");
             self.make_virtio_mem_devices(snapshot)?;
         }
+        let mem_us = phase_started.elapsed().as_micros();
 
         // Add virtio-balloon if required
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.balloon");
             self.make_virtio_balloon_devices(snapshot)?;
         }
+        let balloon_us = phase_started.elapsed().as_micros();
 
         // Add virtio-watchdog device
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.watchdog");
             self.make_virtio_watchdog_devices(snapshot)?;
         }
+        let watchdog_us = phase_started.elapsed().as_micros();
 
         // Add vDPA devices if required
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.vdpa");
             self.make_vdpa_devices(snapshot)?;
         }
+        let vdpa_us = phase_started.elapsed().as_micros();
 
         // Add virtio-rtc device
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio.rtc");
             self.make_virtio_rtc_devices(snapshot)?;
         }
+        let rtc_us = phase_started.elapsed().as_micros();
+
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_virtio_devices block_us={} net_us={} rng_us={} vhost_user_us={} fs_us={} pmem_us={} vsock_us={} mem_us={} balloon_us={} watchdog_us={} vdpa_us={} rtc_us={} total_us={}",
+            block_us,
+            net_us,
+            rng_us,
+            vhost_user_us,
+            fs_us,
+            pmem_us,
+            vsock_us,
+            mem_us,
+            balloon_us,
+            watchdog_us,
+            vdpa_us,
+            rtc_us,
+            virtio_devices_started.elapsed().as_micros(),
+        );
 
         Ok(())
     }
