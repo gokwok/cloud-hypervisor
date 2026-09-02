@@ -25,7 +25,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-#[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
 use std::{iter, path, result, sync};
 
@@ -1503,7 +1502,9 @@ impl DeviceManager {
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<()> {
         trace_scoped!("create_devices");
+        let create_devices_started = Instant::now();
 
+        let phase_started = Instant::now();
         self.cpu_manager
             .lock()
             .unwrap()
@@ -1529,7 +1530,9 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::BusError)?;
             }
         }
+        let wiring_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         #[cfg(target_arch = "x86_64")]
         self.add_legacy_devices(
             self.reset_evt
@@ -1542,7 +1545,9 @@ impl DeviceManager {
             trace_scoped!("restore.devices.legacy");
             self.add_legacy_devices(legacy_interrupt_manager.as_ref(), snapshot)?;
         }
+        let legacy_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         {
             self.ged_notification_device = self.add_acpi_devices(
                 legacy_interrupt_manager.as_ref(),
@@ -1554,33 +1559,43 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::EventFd)?,
             )?;
         }
+        let acpi_us = phase_started.elapsed().as_micros();
 
         self.original_termios_opt = original_termios_opt;
 
+        let phase_started = Instant::now();
         self.console = self.add_console_devices(
             legacy_interrupt_manager.as_ref(),
             console_info,
             console_resize_pipe,
             snapshot,
         )?;
+        let console_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         #[cfg(not(target_arch = "riscv64"))]
         if let Some(tpm) = self.config.clone().lock().unwrap().tpm.as_ref() {
             let tpm_dev = self.add_tpm_device(&tpm.socket)?;
             self.bus_devices
                 .push(Arc::clone(&tpm_dev) as Arc<dyn BusDeviceSync>);
         }
+        let tpm_us = phase_started.elapsed().as_micros();
         self.legacy_interrupt_manager = Some(legacy_interrupt_manager);
 
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.virtio");
             self.make_virtio_devices(snapshot)?;
         }
+        let virtio_us = phase_started.elapsed().as_micros();
+        let phase_started = Instant::now();
         {
             trace_scoped!("restore.devices.pci");
             self.add_pci_devices(snapshot)?;
         }
+        let pci_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         // Add pvmemcontrol if required
         #[cfg(feature = "pvmemcontrol")]
         {
@@ -1603,6 +1618,21 @@ impl DeviceManager {
                 self.ivshmem_device = self.add_ivshmem_device(ivshmem, snapshot)?;
             }
         }
+        let optional_devices_us = phase_started.elapsed().as_micros();
+
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_device_manager wiring_us={} legacy_us={} acpi_us={} console_us={} tpm_us={} virtio_us={} pci_us={} optional_devices_us={} total_us={}",
+            wiring_us,
+            legacy_us,
+            acpi_us,
+            console_us,
+            tpm_us,
+            virtio_us,
+            pci_us,
+            optional_devices_us,
+            create_devices_started.elapsed().as_micros(),
+        );
 
         Ok(())
     }
@@ -1692,6 +1722,7 @@ impl DeviceManager {
 
     #[allow(unused_variables)]
     fn add_pci_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
+        let pci_devices_started = Instant::now();
         let iommu_id = String::from(IOMMU_DEVICE_NAME);
 
         let iommu_address_width_bits =
@@ -1701,6 +1732,7 @@ impl DeviceManager {
                 DEFAULT_IOMMU_ADDRESS_WIDTH_BITS
             };
 
+        let phase_started = Instant::now();
         let iommu_device = if self.config.lock().unwrap().iommu {
             let (device, mapping) = virtio_devices::Iommu::new(
                 iommu_id.clone(),
@@ -1731,8 +1763,10 @@ impl DeviceManager {
         } else {
             None
         };
+        let iommu_prepare_us = phase_started.elapsed().as_micros();
 
         let mut iommu_attached_devices = Vec::new();
+        let phase_started = Instant::now();
         {
             // Reserve all explicit PCI device IDs before any device creation
             // so that they won't be picked for dynamic allocation.
@@ -1799,7 +1833,9 @@ impl DeviceManager {
                 self.iommu_attached_devices = Some((dev_id, iommu_attached_devices));
             }
         }
+        let device_add_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         for segment in &self.pci_segments {
             #[cfg(target_arch = "x86_64")]
             if let Some(pci_config_io) = segment.pci_config_io.as_ref() {
@@ -1810,6 +1846,16 @@ impl DeviceManager {
             self.bus_devices
                 .push(Arc::clone(&segment.pci_config_mmio) as Arc<dyn BusDeviceSync>);
         }
+        let bus_publish_us = phase_started.elapsed().as_micros();
+
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_pci_devices iommu_prepare_us={} device_add_us={} bus_publish_us={} total_us={}",
+            iommu_prepare_us,
+            device_add_us,
+            bus_publish_us,
+            pci_devices_started.elapsed().as_micros(),
+        );
 
         Ok(())
     }
@@ -4590,21 +4636,26 @@ impl DeviceManager {
         pci_device_id: Option<u8>,
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<PciBdf> {
+        let virtio_pci_started = Instant::now();
         let id = format!("{VIRTIO_PCI_DEVICE_NAME_PREFIX}-{virtio_device_id}");
 
         // Add the new virtio-pci node to the device tree.
         let mut node = device_node!(id);
         node.children = vec![virtio_device_id.to_string()];
 
+        let phase_started = Instant::now();
         let (pci_segment_id, pci_device_bdf, resources) =
             self.pci_resources(&id, pci_segment_id, pci_device_id)?;
+        let resources_us = phase_started.elapsed().as_micros();
 
         // Update the existing virtio node by setting the parent.
+        let phase_started = Instant::now();
         if let Some(node) = self.device_tree.lock().unwrap().get_mut(virtio_device_id) {
             node.parent = Some(id.clone());
         } else {
             return Err(DeviceManagerError::MissingNode);
         }
+        let tree_parent_us = phase_started.elapsed().as_micros();
 
         // Create the AccessPlatform trait from the implementation IommuMapping.
         // This will provide address translation for any virtio device sitting
@@ -4626,6 +4677,7 @@ impl DeviceManager {
             )));
         }
 
+        let phase_started = Instant::now();
         let memory = self.memory_manager.lock().unwrap().guest_memory();
 
         // Map DMA ranges if a DMA handler is available and if the device is
@@ -4667,7 +4719,9 @@ impl DeviceManager {
                 }
             }
         }
+        let memory_dma_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         let device_type = virtio_device.lock().unwrap().device_type();
         let virtio_pci_device = Arc::new(Mutex::new(
             VirtioPciDevice::new(
@@ -4690,10 +4744,14 @@ impl DeviceManager {
             )
             .map_err(DeviceManagerError::VirtioDevice)?,
         ));
+        let transport_new_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         let (bars, new_resources) =
             self.allocate_pci_bars(virtio_pci_device.clone(), pci_segment_id, resources)?;
+        let bars_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         let bar_addr = virtio_pci_device.lock().unwrap().config_bar_addr();
         for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
             let io_addr = IoEventAddress::Mmio(addr);
@@ -4702,14 +4760,18 @@ impl DeviceManager {
                 .register_ioevent(event, &io_addr, None)
                 .map_err(|e| DeviceManagerError::RegisterIoevent(e.into()))?;
         }
+        let ioevent_us = phase_started.elapsed().as_micros();
 
         // Update the device tree with correct resource information.
+        let phase_started = Instant::now();
         node.resources = new_resources;
         node.migratable = Some(Arc::clone(&virtio_pci_device) as Arc<Mutex<dyn Migratable>>);
         node.pci_bdf = Some(pci_device_bdf);
         node.pci_device_handle = Some(PciDeviceHandle::Virtio(virtio_pci_device.clone()));
         self.device_tree.lock().unwrap().insert(id, node);
+        let tree_publish_us = phase_started.elapsed().as_micros();
 
+        let phase_started = Instant::now();
         self.commit_pci_device(
             virtio_pci_device.clone(),
             virtio_pci_device,
@@ -4717,6 +4779,22 @@ impl DeviceManager {
             pci_device_bdf,
             bars,
         )?;
+        let commit_us = phase_started.elapsed().as_micros();
+
+        warn!(
+            target: "ch_timing",
+            "ch_timing event=ch_restore_virtio_pci_device device={} resources_us={} tree_parent_us={} memory_dma_us={} transport_new_us={} bars_us={} ioevent_us={} tree_publish_us={} commit_us={} total_us={}",
+            virtio_device_id,
+            resources_us,
+            tree_parent_us,
+            memory_dma_us,
+            transport_new_us,
+            bars_us,
+            ioevent_us,
+            tree_publish_us,
+            commit_us,
+            virtio_pci_started.elapsed().as_micros(),
+        );
 
         Ok(pci_device_bdf)
     }

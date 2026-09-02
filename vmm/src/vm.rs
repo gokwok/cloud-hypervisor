@@ -1456,6 +1456,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
         let vm_new_started = Instant::now();
@@ -1483,6 +1484,7 @@ impl Vm {
         };
 
         let phase_started = Instant::now();
+        let mut used_precreated_vm = false;
         let vm = {
             trace_scoped!("restore.create_hypervisor_vm");
             #[allow(unused_mut)]
@@ -1492,7 +1494,25 @@ impl Vm {
             if let Some(ref igvm) = igvm_file {
                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
             }
-            Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
+            let standard_kvm_vm = {
+                #[allow(unused_mut)]
+                let mut standard = true;
+                #[cfg(feature = "tdx")]
+                {
+                    standard &= !hv_config.tdx_enabled;
+                }
+                #[cfg(feature = "sev_snp")]
+                {
+                    standard &= !hv_config.sev_snp_enabled;
+                }
+                standard
+            };
+            if standard_kvm_vm && precreated_vm.is_some() {
+                used_precreated_vm = true;
+                precreated_vm.expect("pre-created VM checked above")
+            } else {
+                Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
+            }
         };
         let create_hypervisor_vm_us = phase_started.elapsed().as_micros();
 
@@ -1568,8 +1588,9 @@ impl Vm {
         let vm_components_us = phase_started.elapsed().as_micros();
         warn!(
             target: "ch_timing",
-            "ch_timing event=ch_restore_vm_new create_hypervisor_vm_us={} x2apic_us={} physical_bits_us={} memory_manager_us={} vm_components_us={} total_us={}",
+            "ch_timing event=ch_restore_vm_new create_hypervisor_vm_us={} used_precreated_vm={} x2apic_us={} physical_bits_us={} memory_manager_us={} vm_components_us={} total_us={}",
             create_hypervisor_vm_us,
+            u8::from(used_precreated_vm),
             x2apic_us,
             physical_bits_us,
             memory_manager_us,

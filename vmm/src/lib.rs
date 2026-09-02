@@ -183,6 +183,10 @@ pub enum Error {
     #[error("Error spawning VMM thread")]
     VmmThreadSpawn(#[source] io::Error),
 
+    /// Cannot pre-create the empty hypervisor VM owned by an idle VMM.
+    #[error("Error pre-creating hypervisor VM")]
+    PrecreateVm(#[source] VmError),
+
     /// Cannot shut the VMM down
     #[error("Error shutting down VMM")]
     VmmShutdown(#[source] VmError),
@@ -689,6 +693,10 @@ pub struct Vmm {
     vm_config: Option<Arc<Mutex<VmConfig>>>,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    // An idle VMM owns one empty KVM VM so that KVM_CREATE_VM and the
+    // process-wide KVM warm-up stay outside the create/restore request path.
+    // This VM has no memory, vCPUs, or devices and is consumed at most once.
+    precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
     activate_evt: EventFd,
     signals: Option<Handle>,
     threads: Vec<thread::JoinHandle<()>>,
@@ -868,6 +876,31 @@ impl Vmm {
         exit_evt: EventFd,
         no_shutdown: bool,
     ) -> Result<Self> {
+        let precreated_vm = {
+            #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+            {
+                if hypervisor.hypervisor_type() == hypervisor::HypervisorType::Kvm {
+                    let started = Instant::now();
+                    let vm = Vm::create_hypervisor_vm(
+                        hypervisor.as_ref(),
+                        hypervisor::HypervisorVmConfig::default(),
+                    )
+                    .map_err(Error::PrecreateVm)?;
+                    warn!(
+                        target: "ch_timing",
+                        "ch_timing event=ch_precreate_hypervisor_vm total_us={}",
+                        started.elapsed().as_micros(),
+                    );
+                    Some(vm)
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
+            {
+                None
+            }
+        };
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
         let guest_exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -918,6 +951,7 @@ impl Vmm {
             vm_config: None,
             seccomp_action,
             hypervisor,
+            precreated_vm,
             activate_evt,
             signals: None,
             threads: vec![],
@@ -1965,6 +1999,7 @@ impl Vmm {
                 let phase_started = Instant::now();
                 let mut vm = {
                     trace_scoped!("restore.vm_new");
+                    let precreated_vm = self.precreated_vm.take();
                     Vm::new(
                         vm_config,
                         exit_evt,
@@ -1982,6 +2017,7 @@ impl Vmm {
                         Some(source_url),
                         Some(prefault),
                         Some(memory_restore_mode),
+                        precreated_vm,
                     )?
                 };
                 let vm_new_us = phase_started.elapsed().as_micros();
@@ -2313,6 +2349,7 @@ impl RequestHandler for Vmm {
                         .map_err(VmError::EventFdClone)?;
 
                     if let Some(ref vm_config) = self.vm_config {
+                        let precreated_vm = self.precreated_vm.take();
                         let mut vm = Vm::new(
                             Arc::clone(vm_config),
                             exit_evt,
@@ -2330,6 +2367,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            precreated_vm,
                         )?;
 
                         let r = vm.boot();
@@ -2556,6 +2594,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,
