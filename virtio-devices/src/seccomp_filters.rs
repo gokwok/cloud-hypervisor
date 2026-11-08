@@ -469,6 +469,33 @@ pub fn get_seccomp_filter(action: &SeccompAction, thread: Thread) -> Result<BpfP
     get_cached_seccomp_filter(action, thread).map(|program| program.as_ref().clone())
 }
 
+/// Compile every device filter ahead of time, so a later activation only
+/// installs cached programs.
+pub fn precompile_seccomp_filters(action: &SeccompAction) -> Result<(), Error> {
+    for thread in [
+        Thread::VirtioBalloon,
+        Thread::VirtioBlock,
+        Thread::VirtioConsole,
+        Thread::VirtioIommu,
+        Thread::VirtioMem,
+        Thread::VirtioNet,
+        Thread::VirtioNetCtl,
+        Thread::VirtioPmem,
+        Thread::VirtioRng,
+        Thread::VirtioRtc,
+        Thread::VirtioVhostBlock,
+        Thread::VirtioVhostFs,
+        Thread::VirtioGenericVhostUser,
+        Thread::VirtioVhostNet,
+        Thread::VirtioVhostNetCtl,
+        Thread::VirtioVsock,
+        Thread::VirtioWatchdog,
+    ] {
+        get_cached_seccomp_filter(action, thread)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;

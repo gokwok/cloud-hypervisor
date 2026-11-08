@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
+use virtio_devices::seccomp_filters::precompile_seccomp_filters;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::*;
@@ -3082,6 +3083,9 @@ impl RequestHandler for Vmm {
                 "VMM is already prepared; use vm.delete to re-prepare"
             )));
         }
+
+        // Device workers then only install already compiled filters.
+        precompile_seccomp_filters(&self.seccomp_action).map_err(|e| VmError::Prepare(e.into()))?;
 
         let response = PrepareResponse {
             pre_vm: config.pre_vm,
