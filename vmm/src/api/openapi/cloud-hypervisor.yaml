@@ -158,6 +158,18 @@ paths:
     put:
       summary: Boot the previously created VM instance.
       operationId: bootVM
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                start_dirty_log:
+                  type: boolean
+                  default: false
+                  description: Whether to enable dirty log tracking before booting.
       responses:
         204:
           description: The VM instance successfully booted.
@@ -729,6 +741,9 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/DeviceNode"
+        dirty_log_enabled:
+          description: Whether dirty log tracking is enabled
+          type: boolean
       description: Virtual Machine information
 
     DeviceNode:
@@ -1746,6 +1761,13 @@ components:
       properties:
         destination_url:
           type: string
+        diff:
+          type: boolean
+          default: false
+          description: Whether to produce a diff snapshot (dirty pages only).
+        memory_file_path:
+          type: string
+          description: Custom memory file path; defaults to <destination_url>/memory-ranges or .diff.
 
     VmCoredumpData:
       type: object
@@ -1780,6 +1802,9 @@ components:
           description: >
             Filesystem path of the snapshot memory file. Defaults to
             `<source_url>/memory-ranges` when absent.
+        start_dirty_log:
+          description: Whether to enable dirty log tracking after restore.
+          type: boolean
 
     ReceiveMigrationData:
       required:

@@ -51,8 +51,8 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, DeviceConfig, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot,
-    VmReceiveMigration, VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk,
+    VmBootData, VmCancelMigration, VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton,
+    VmReboot, VmReceiveMigration, VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk,
     VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPrepare,
     VmmQueryPrepare,
 };
@@ -466,7 +466,27 @@ macro_rules! vm_action_put_handler_body {
 vm_action_get_handler!(VmCounters);
 vm_action_get_handler!(VmmQueryPrepare);
 
-vm_action_put_handler!(VmBoot);
+// VmBoot accepts an optional body: no body keeps the defaults
+// (start_dirty_log=false), a present body is deserialized into VmBootData.
+impl PutHandler for VmBoot {
+    fn handle_request(
+        &'static self,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+        body: &Option<Body>,
+        _files: Vec<File>,
+    ) -> result::Result<Option<Body>, HttpError> {
+        let data: Option<VmBootData> = match body {
+            Some(b) => Some(serde_json::from_slice(b.raw())?),
+            None => None,
+        };
+        self.send(api_notifier, api_sender, data)
+            .map_err(HttpError::ApiError)
+    }
+}
+
+impl GetHandler for VmBoot {}
+
 vm_action_put_handler!(VmDelete);
 vm_action_put_handler!(VmShutdown);
 vm_action_put_handler!(VmReboot);

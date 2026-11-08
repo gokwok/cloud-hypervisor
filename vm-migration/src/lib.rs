@@ -4,6 +4,7 @@
 //
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -253,6 +254,17 @@ pub trait Snapshottable: Pausable {
     }
 }
 
+/// Configuration for a [`Transportable::send`] operation.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotSendConfig {
+    /// The destination URL to send the snapshot to.
+    pub destination_url: String,
+    /// When set, only the given dirty ranges are written (diff snapshot).
+    pub diff_ranges: Option<MemoryRangeTable>,
+    /// When set, overrides `<destination_url>/memory-ranges(.diff)`.
+    pub memory_file_path: Option<PathBuf>,
+}
+
 /// A transportable component can be sent or receive to a specific URL.
 ///
 /// This trait is meant to be used for component that have custom
@@ -263,12 +275,11 @@ pub trait Transportable: Pausable + Snapshottable {
     /// # Arguments
     ///
     /// * `snapshot` - The migratable component snapshot to send.
-    /// * `destination_url` - The destination URL to send the snapshot to. This
-    ///   could be an HTTP endpoint, a TCP address or a local file.
+    /// * `config` - Where and what to send.
     fn send(
         &self,
         _snapshot: &Snapshot,
-        _destination_url: &str,
+        _config: &SnapshotSendConfig,
     ) -> result::Result<(), MigratableError> {
         Ok(())
     }

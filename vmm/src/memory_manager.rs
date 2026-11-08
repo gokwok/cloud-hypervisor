@@ -46,8 +46,8 @@ use vm_memory::{
 };
 use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
-    UffdError,
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotData, SnapshotSendConfig,
+    Snapshottable, Transportable, UffdError,
 };
 use vmm_sys_util::eventfd::EventFd;
 
@@ -3665,26 +3665,137 @@ impl Snapshottable for MemoryManager {
     }
 }
 
+/// Open a memory file at an explicit path. The parent directory must exist.
+///
+/// A new file is created and sized; failing to size it only means sparse
+/// layout is unsupported. An existing file is reused in place without being
+/// resized and must already hold the full layout: a diff snapshot overlays
+/// it, keeping the previous content outside the dirty ranges.
+///
+/// Returns the file and whether a sparse write may rely on unwritten ranges
+/// reading as zero.
+fn open_memory_file_at_path(path: &Path, total_len: u64) -> Result<(File, bool), MigratableError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Err(MigratableError::MigrateSend(anyhow!(
+            "Memory file parent path is not a directory: {parent:?}"
+        )));
+    }
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let sparse = file.set_len(total_len).is_ok();
+            Ok((file, sparse))
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("Error opening memory snapshot file {path:?}"))
+                .map_err(MigratableError::MigrateSend)?;
+            let existing_len = file
+                .metadata()
+                .with_context(|| format!("Error reading memory snapshot file metadata {path:?}"))
+                .map_err(MigratableError::MigrateSend)?
+                .len();
+            if existing_len < total_len {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "Memory file is too small: {existing_len} < {total_len}: {path:?}"
+                )));
+            }
+            // Old content is still there, so every byte must be written.
+            Ok((file, false))
+        }
+        Err(e) => Err(MigratableError::MigrateSend(
+            anyhow!(e).context(format!("Error creating memory snapshot file {path:?}")),
+        )),
+    }
+}
+
+/// Create the memory file inside the destination directory:
+/// `memory-ranges` for a full snapshot, `memory-ranges.diff` for a diff.
+fn open_memory_file_at_url(
+    config: &SnapshotSendConfig,
+    total_len: u64,
+) -> Result<(File, bool), MigratableError> {
+    let mut memory_file_path = url_to_path(&config.destination_url)?;
+    memory_file_path.push(if config.diff_ranges.is_some() {
+        format!("{SNAPSHOT_FILENAME}.diff")
+    } else {
+        String::from(SNAPSHOT_FILENAME)
+    });
+
+    let memory_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&memory_file_path)
+        .with_context(|| format!("Error creating memory snapshot file {memory_file_path:?}"))
+        .map_err(MigratableError::MigrateSend)?;
+
+    // Pre-size the file so per-region writes land at the dense-layout
+    // offset. If extending the file is not supported by the destination
+    // filesystem (some FUSE backends reject ftruncate-extend with
+    // EOPNOTSUPP), fall back to the dense write path which never writes past
+    // the growing EOF.
+    let sparse_layout = memory_file.set_len(total_len).is_ok();
+    Ok((memory_file, sparse_layout))
+}
+
+/// Write plan for a full snapshot: each region at its dense-layout offset.
+fn build_full_write_plan(full_ranges: &MemoryRangeTable) -> Vec<(u64, MemoryRange)> {
+    let mut write_plan = Vec::new();
+    let mut layout_cursor: u64 = 0;
+    for full in full_ranges.ranges() {
+        write_plan.push((layout_cursor, *full));
+        layout_cursor += full.length;
+    }
+    write_plan
+}
+
+/// Write plan for a diff snapshot: each dirty extent intersected with its
+/// full region, placed at the same offset as in the full layout.
+fn build_diff_write_plan(
+    full_ranges: &MemoryRangeTable,
+    dirty: &MemoryRangeTable,
+) -> Vec<(u64, MemoryRange)> {
+    let mut write_plan = Vec::new();
+    let mut layout_cursor: u64 = 0;
+    for full in full_ranges.ranges() {
+        for d in dirty.ranges() {
+            let start = d.gpa.max(full.gpa);
+            let end = (d.gpa + d.length).min(full.gpa + full.length);
+            if start < end {
+                write_plan.push((
+                    layout_cursor + (start - full.gpa),
+                    MemoryRange {
+                        gpa: start,
+                        length: end - start,
+                    },
+                ));
+            }
+        }
+        layout_cursor += full.length;
+    }
+    write_plan
+}
+
 impl Transportable for MemoryManager {
     fn send(
         &self,
         _snapshot: &Snapshot,
-        destination_url: &str,
+        config: &SnapshotSendConfig,
     ) -> result::Result<(), MigratableError> {
         if self.snapshot_memory_ranges.is_empty() {
             return Ok(());
         }
-
-        let mut memory_file_path = url_to_path(destination_url)?;
-        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
-
-        let mut memory_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&memory_file_path)
-            .with_context(|| format!("Error creating memory snapshot file {memory_file_path:?}"))
-            .map_err(MigratableError::MigrateSend)?;
 
         let total_len: u64 = self
             .snapshot_memory_ranges
@@ -3693,36 +3804,41 @@ impl Transportable for MemoryManager {
             .map(|r| r.length)
             .sum();
 
-        // Pre-size the file so per-region write_at lands at the dense-layout
-        // offset. On filesystems that support sparse files unwritten bytes
-        // become real holes; on others the kernel zero-fills the allocation,
-        // which is still byte-correct. If extending the file is not
-        // supported by the destination filesystem (some FUSE backends
-        // reject ftruncate-extend with EOPNOTSUPP), fall back to the dense
-        // write path which never writes past the growing EOF.
-        let sparse_layout = memory_file.set_len(total_len).is_ok();
+        let (mut memory_file, sparse_layout) = match &config.memory_file_path {
+            Some(path) => open_memory_file_at_path(path, total_len)?,
+            None => open_memory_file_at_url(config, total_len)?,
+        };
+
+        // A diff must write every dirty page: a page whose backing is a hole
+        // must not be skipped, or it would be missing from the delta. Force
+        // the dense path.
+        let sparse_layout = sparse_layout && config.diff_ranges.is_none();
+
+        let write_plan = match &config.diff_ranges {
+            None => build_full_write_plan(&self.snapshot_memory_ranges),
+            Some(dirty) => build_diff_write_plan(&self.snapshot_memory_ranges, dirty),
+        };
 
         let guest_memory = self.guest_memory.memory();
-        let mut file_cursor: u64 = 0;
 
-        for range in self.snapshot_memory_ranges.ranges() {
+        for (file_offset, range) in write_plan {
             let mut wrote_sparse = false;
             if sparse_layout
                 && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
                 && (region.flags() & libc::MAP_SHARED) == libc::MAP_SHARED
-                && let Some(file_offset) = region.file_offset()
+                && let Some(region_file_offset) = region.file_offset()
             {
                 let region_base = region.start_addr().raw_value();
-                let in_fd_off = file_offset.start()
+                let in_fd_off = region_file_offset.start()
                     + range
                         .gpa
                         .checked_sub(region_base)
                         .expect("range outside its region");
                 wrote_sparse = write_region_sparse(
-                    file_offset.file(),
+                    region_file_offset.file(),
                     in_fd_off,
                     &memory_file,
-                    file_cursor,
+                    file_offset,
                     range.length,
                 )
                 .context("Error writing sparse memory snapshot region")
@@ -3731,11 +3847,10 @@ impl Transportable for MemoryManager {
 
             if !wrote_sparse {
                 // Dense fallback: anonymous mmap or hugetlbfs (no
-                // SEEK_HOLE). Match the dense layout by seeking to
-                // file_cursor and streaming bytes via the existing
-                // volatile copy.
+                // SEEK_HOLE). Seek to the planned offset and stream bytes
+                // via the volatile copy.
                 memory_file
-                    .seek(SeekFrom::Start(file_cursor))
+                    .seek(SeekFrom::Start(file_offset))
                     .context("Error seeking memory snapshot file")
                     .map_err(MigratableError::MigrateSend)?;
                 let mut offset: u64 = 0;
@@ -3756,11 +3871,8 @@ impl Transportable for MemoryManager {
                     }
                 }
             }
-
-            file_cursor += range.length;
         }
 
-        debug_assert_eq!(file_cursor, total_len);
         Ok(())
     }
 }

@@ -194,7 +194,7 @@ impl DBusApi {
     }
 
     async fn vm_boot(&self) -> Result<()> {
-        self.vm_action(&VmBoot, ()).await.map(|_| ())
+        self.vm_action(&VmBoot, None).await.map(|_| ())
     }
 
     #[allow(unused_variables)]

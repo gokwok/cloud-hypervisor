@@ -20,7 +20,7 @@ use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use event_monitor::event;
 use libc::EFD_NONBLOCK;
 use log::{LevelFilter, error, info, warn};
-use option_parser::OptionParser;
+use option_parser::{OptionParser, Toggle};
 use seccompiler::SeccompAction;
 use signal_hook::consts::SIGSYS;
 use signal_hook::low_level;
@@ -156,6 +156,8 @@ enum Error {
     StartVmmThread(#[source] vmm::Error),
     #[error("Error parsing config")]
     ParsingConfig(#[source] config::Error),
+    #[error("Invalid CLI parameter: {0}")]
+    InvalidCliParameter(String),
     #[error("Error creating VM")]
     VmCreate(#[source] api::ApiError),
     #[error("Error booting VM")]
@@ -515,6 +517,14 @@ fn get_cli_options_sorted(
             .help(SerialConfig::SYNTAX)
             .default_value("null")
             .group("vm-config"),
+        Arg::new("start-dirty-log")
+            .long("start-dirty-log")
+            .help(
+                "Enable dirty log tracking before boot (on|off, default off). \
+                 Only for cold boot (--kernel); mutually exclusive with --restore.",
+            )
+            .num_args(1)
+            .group("vmm-config"),
         Arg::new("tpm")
             .long("tpm")
             .num_args(1)
@@ -580,6 +590,27 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
         .arg_required_else_help(true)
         .groups(groups)
         .args(args)
+}
+
+/// Parse `--start-dirty-log on|off|true|false` (default `off`).
+fn parse_start_dirty_log(cmd_arguments: &ArgMatches) -> Result<bool, Error> {
+    match cmd_arguments.get_one::<String>("start-dirty-log") {
+        Some(v) => {
+            let mut parser = OptionParser::new();
+            parser.add("start_dirty_log");
+            parser
+                .parse(&format!("start_dirty_log={v}"))
+                .map_err(|e| Error::InvalidCliParameter(format!("{e}")))?;
+            parser
+                .convert::<Toggle>("start_dirty_log")
+                .map_err(|e| Error::InvalidCliParameter(format!("{e}")))?
+                .map(|t| t.0)
+                .ok_or_else(|| {
+                    Error::InvalidCliParameter("missing start_dirty_log value".to_string())
+                })
+        }
+        None => Ok(false),
+    }
 }
 
 fn parse_api_socket(cmd_arguments: &ArgMatches) -> Result<(Option<String>, Option<RawFd>), Error> {
@@ -841,9 +872,25 @@ fn start_vmm(
                 )
                 .map_err(Error::VmCreate)?;
             api::VmBoot
-                .send(api_evt.try_clone().unwrap(), sender, ())
+                .send(
+                    api_evt.try_clone().unwrap(),
+                    sender,
+                    Some(api::VmBootData {
+                        start_dirty_log: parse_start_dirty_log(cmd_arguments)?,
+                    }),
+                )
                 .map_err(Error::VmBoot)?;
         } else if let Some(restore_params) = cmd_arguments.get_one::<String>("restore") {
+            // --start-dirty-log is only for cold boot (--kernel); reject when
+            // combined with --restore (restore path uses start_dirty_log=on|off
+            // in the restore config string instead).
+            if cmd_arguments.get_one::<String>("start-dirty-log").is_some() {
+                return Err(Error::InvalidCliParameter(
+                    "--start-dirty-log is only for cold boot (--kernel); \
+                     use start_dirty_log=on|off in --restore config string instead"
+                        .to_string(),
+                ));
+            }
             api::VmRestore
                 .send(
                     api_evt.try_clone().unwrap(),

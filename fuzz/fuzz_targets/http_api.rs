@@ -14,8 +14,8 @@ use micro_http::Request;
 use vm_migration::MigratableError;
 use vmm::api::http::*;
 use vmm::api::{
-    ApiRequest, BalloonStatsResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
-    VmSendMigrationData, VmmPingResponse,
+    ApiRequest, BalloonStatsResponse, RequestHandler, VmBootData, VmInfoResponse,
+    VmReceiveMigrationData, VmSendMigrationData, VmSnapshotConfig, VmmPingResponse,
 };
 use vmm::config::RestoreConfig;
 use vmm::prepare::PrepareConfig;
@@ -94,7 +94,7 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(())
     }
 
-    fn vm_boot(&mut self) -> Result<(), VmError> {
+    fn vm_boot(&mut self, _data: Option<VmBootData>) -> Result<(), VmError> {
         Ok(())
     }
 
@@ -106,7 +106,7 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(())
     }
 
-    fn vm_snapshot(&mut self, _: &str) -> Result<(), VmError> {
+    fn vm_snapshot(&mut self, _: &VmSnapshotConfig) -> Result<(), VmError> {
         Ok(())
     }
 
@@ -220,6 +220,7 @@ impl RequestHandler for StubApiRequestHandler {
             state: VmState::Running,
             memory_actual_size: 0,
             device_tree: None,
+            dirty_log_enabled: false,
         })
     }
 

@@ -20,7 +20,7 @@ use api_client::{
 use clap::ArgAction;
 use clap::{Arg, ArgMatches, Command};
 use log::error;
-use option_parser::{ByteSized, ByteSizedParseError, OptionParserError};
+use option_parser::{ByteSized, ByteSizedParseError, OptionParser, OptionParserError, Toggle};
 use thiserror::Error;
 use vmm::api;
 use vmm::config::{self, RestoreConfig};
@@ -79,6 +79,12 @@ enum Error {
     ReceiveMigrationConfig(#[from] api::VmReceiveMigrationConfigError),
     #[error("Error parsing send migration configuration")]
     SendMigrationConfig(#[from] api::VmSendMigrationConfigError),
+    #[error("Error parsing boot syntax")]
+    BootConfig(#[source] OptionParserError),
+    #[error("Error parsing snapshot syntax")]
+    SnapshotConfig(#[source] OptionParserError),
+    #[error("Error parsing snapshot syntax: destination_url missing")]
+    SnapshotDestinationUrlMissing,
 }
 
 enum TargetApi<'a> {
@@ -302,7 +308,8 @@ impl TargetApi<'_> {
 fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResult {
     match matches.subcommand_name() {
         Some("boot") => {
-            simple_api_command(socket, "PUT", "boot", None).map_err(Error::HttpApiClient)
+            let data = boot_data(matches)?;
+            simple_api_command(socket, "PUT", "boot", Some(&data)).map_err(Error::HttpApiClient)
         }
         Some("delete") => {
             simple_api_command(socket, "PUT", "delete", None).map_err(Error::HttpApiClient)
@@ -522,7 +529,7 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
                     .unwrap()
                     .get_one::<String>("snapshot_config")
                     .unwrap(),
-            );
+            )?;
             simple_api_command(socket, "PUT", "snapshot", Some(&snapshot_config))
                 .map_err(Error::HttpApiClient)
         }
@@ -749,7 +756,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
                     .unwrap()
                     .get_one::<String>("snapshot_config")
                     .unwrap(),
-            );
+            )?;
             proxy.api_vm_snapshot(&snapshot_config)
         }
         Some("restore") => {
@@ -956,12 +963,71 @@ fn add_vsock_config(config: &str) -> Result<String, Error> {
     Ok(vsock_config)
 }
 
-fn snapshot_config(url: &str) -> String {
-    let snapshot_config = api::VmSnapshotConfig {
-        destination_url: String::from(url),
+/// Whether `config` opens with a recognised `key=`, i.e. uses the key=value
+/// form. A bare destination URL may itself contain `=`, so the test inspects
+/// the known prefixes rather than looking for an `=` anywhere.
+fn is_key_value_form(config: &str) -> bool {
+    ["destination_url=", "diff=", "memory_file_path="]
+        .iter()
+        .any(|prefix| config.starts_with(prefix))
+}
+
+fn snapshot_config(config: &str) -> Result<String, Error> {
+    // `snapshot <url>` predates the key=value form and existing scripts still
+    // use it, so anything that is not the newer form is a bare destination URL.
+    let (destination_url, diff, memory_file_path) = if is_key_value_form(config) {
+        let mut parser = OptionParser::new();
+        parser
+            .add("destination_url")
+            .add("diff")
+            .add("memory_file_path");
+        parser.parse(config).map_err(Error::SnapshotConfig)?;
+
+        let destination_url = parser
+            .get("destination_url")
+            .ok_or(Error::SnapshotDestinationUrlMissing)?;
+        let diff = parser
+            .convert::<Toggle>("diff")
+            .map_err(Error::SnapshotConfig)?
+            .unwrap_or(Toggle(false))
+            .0;
+        (destination_url, diff, parser.get("memory_file_path"))
+    } else {
+        (config.to_owned(), false, None)
     };
 
-    serde_json::to_string(&snapshot_config).unwrap()
+    let snapshot_config = api::VmSnapshotConfig {
+        destination_url,
+        diff,
+        memory_file_path,
+    };
+
+    Ok(serde_json::to_string(&snapshot_config).unwrap())
+}
+
+/// Build the JSON body for `vm.boot` from an optional
+/// `start_dirty_log=on|off` position-argument string.
+fn boot_data(matches: &ArgMatches) -> Result<String, Error> {
+    let config_str = matches
+        .subcommand_matches("boot")
+        .and_then(|m| m.get_one::<String>("boot"))
+        .map_or("", String::as_str);
+
+    let mut start_dirty_log = false;
+    if !config_str.is_empty() {
+        let mut parser = OptionParser::new();
+        parser.add("start_dirty_log");
+        parser.parse(config_str).map_err(Error::BootConfig)?;
+        if let Some(v) = parser
+            .convert::<Toggle>("start_dirty_log")
+            .map_err(Error::BootConfig)?
+        {
+            start_dirty_log = v.0;
+        }
+    }
+
+    let data = api::VmBootData { start_dirty_log };
+    Ok(serde_json::to_string(&data).unwrap())
 }
 
 fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
@@ -1111,7 +1177,11 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
             .about("Add vsock device")
             .arg(Arg::new("vsock_config").index(1).help(VsockConfig::SYNTAX)),
         Command::new("balloon-stats").about("Statistics from the virtio-balloon device"),
-        Command::new("boot").about("Boot a created VM"),
+        Command::new("boot").about("Boot a created VM").arg(
+            Arg::new("boot")
+                .index(1)
+                .help("Optional: start_dirty_log=on|off"),
+        ),
         Command::new("cancel-migration").about("Cancel any ongoing migration"),
         Command::new("coredump")
             .about("Create a coredump from VM")
@@ -1213,12 +1283,9 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
         Command::new("shutdown-vmm").about("Shutdown the VMM"),
         Command::new("snapshot")
             .about("Create a snapshot from VM")
-            .arg(
-                Arg::new("snapshot_config")
-                    .index(1)
-                    .required(true)
-                    .help("<destination_url>"),
-            ),
+            .arg(Arg::new("snapshot_config").index(1).required(true).help(
+                "<url> | destination_url=<url>[,diff=on|off][,memory_file_path=<memory file path>]",
+            )),
     ]
     .to_vec()
     .into_boxed_slice()
@@ -1405,5 +1472,65 @@ mod tests {
             lines[4],
             r#"Destination is not a directory: "/tmp/ch.dump""#
         );
+    }
+
+    #[test]
+    fn test_snapshot_config() {
+        // Legacy form: a bare URL with no key=value still names the
+        // destination, so existing scripts keep working.
+        let cfg: api::VmSnapshotConfig =
+            serde_json::from_str(&snapshot_config("file:///tmp/snap1").unwrap()).unwrap();
+        assert_eq!(cfg.destination_url, "file:///tmp/snap1");
+        assert!(!cfg.diff);
+        assert!(cfg.memory_file_path.is_none());
+
+        // A bare URL may contain `=`; it must still be taken as the whole
+        // destination, not parsed as key=value.
+        for url in [
+            "file:///tmp/a=b/snap",
+            "file:///tmp/snap?x=1",
+            "tcp://host:1234/path?a=b",
+        ] {
+            let cfg: api::VmSnapshotConfig =
+                serde_json::from_str(&snapshot_config(url).unwrap()).unwrap();
+            assert_eq!(cfg.destination_url, url);
+            assert!(!cfg.diff);
+            assert!(cfg.memory_file_path.is_none());
+        }
+
+        // Key=value only form.
+        let cfg: api::VmSnapshotConfig =
+            serde_json::from_str(&snapshot_config("destination_url=file:///tmp/snap1").unwrap())
+                .unwrap();
+        assert_eq!(cfg.destination_url, "file:///tmp/snap1");
+        assert!(!cfg.diff);
+        assert!(cfg.memory_file_path.is_none());
+
+        // With diff and memory_file_path.
+        let cfg: api::VmSnapshotConfig = serde_json::from_str(
+            &snapshot_config(
+                "destination_url=file:///tmp/snap1,diff=on,memory_file_path=/data/mem/diff1.bin",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.destination_url, "file:///tmp/snap1");
+        assert!(cfg.diff);
+        assert_eq!(cfg.memory_file_path.as_deref(), Some("/data/mem/diff1.bin"));
+
+        // diff=off.
+        let cfg: api::VmSnapshotConfig = serde_json::from_str(
+            &snapshot_config(
+                "destination_url=file:///tmp/snap2,diff=off,memory_file_path=/data/mem/diff2.bin",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.destination_url, "file:///tmp/snap2");
+        assert!(!cfg.diff);
+        assert_eq!(cfg.memory_file_path.as_deref(), Some("/data/mem/diff2.bin"));
+
+        // Missing destination_url is an error.
+        snapshot_config("diff=on").unwrap_err();
     }
 }

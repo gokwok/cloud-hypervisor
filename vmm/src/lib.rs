@@ -41,7 +41,7 @@ use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::*;
 use vm_migration::{
     MemoryMigrationContext, Migratable, MigratableError, OngoingMigrationContext, Pausable,
-    Snapshot, Snapshottable, Transportable,
+    Snapshot, SnapshotSendConfig, Snapshottable, Transportable,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
@@ -49,7 +49,8 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
     ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, TimeoutStrategy,
-    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    VmBootData, VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmSnapshotConfig,
+    VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -617,6 +618,39 @@ where
     let value = f()?;
     let duration = begin.elapsed();
     Ok((value, duration))
+}
+
+/// Renders the snapshot completion log line. `dirty_bytes` is only set for
+/// diff snapshots; `harvest` is only meaningful in that case.
+fn snapshot_log(
+    config: &VmSnapshotConfig,
+    serialize: Duration,
+    harvest: Duration,
+    dirty_bytes: Option<u64>,
+    write: Duration,
+    total: Duration,
+) -> String {
+    let mut properties = format!(
+        "type={}, destination={}, serialize={}ms",
+        if config.diff { "diff" } else { "full" },
+        config.destination_url,
+        serialize.as_millis(),
+    );
+    if let Some(dirty_bytes) = dirty_bytes {
+        properties.push_str(&format!(
+            ", harvest={}ms, dirty={dirty_bytes}bytes",
+            harvest.as_millis()
+        ));
+    }
+    if let Some(path) = &config.memory_file_path {
+        properties.push_str(&format!(", memory_file_path={path}"));
+    }
+    properties.push_str(&format!(
+        ", write={}ms, total={}ms",
+        write.as_millis(),
+        total.as_millis()
+    ));
+    properties
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -2576,7 +2610,7 @@ impl RequestHandler for Vmm {
         Ok(())
     }
 
-    fn vm_boot(&mut self) -> result::Result<(), VmError> {
+    fn vm_boot(&mut self, data: Option<VmBootData>) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
@@ -2641,6 +2675,12 @@ impl RequestHandler for Vmm {
                             prepared_workers,
                         )?;
 
+                        // Enable dirty log tracking before booting (vCPUs not
+                        // yet running, so no guest writes are missed).
+                        if data.as_ref().is_some_and(|d| d.start_dirty_log) {
+                            vm.start_dirty_log().map_err(VmError::Snapshot)?;
+                        }
+
                         let r = vm.boot();
                         self.vm = VmOwnership::Owned(vm);
                         r
@@ -2686,20 +2726,53 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 if vm.restoring() {
                     return Err(VmError::VmRestoring);
                 }
+                if config.diff && !vm.dirty_log_enabled() {
+                    return Err(VmError::DiffSnapshotDirtyLogDisabled);
+                }
                 // Drain console_info so that FDs are not reused
                 let _ = self.console_info.take();
-                vm.snapshot()
-                    .map_err(VmError::Snapshot)
-                    .and_then(|snapshot| {
-                        vm.send(&snapshot, destination_url)
-                            .map_err(VmError::SnapshotSend)
-                    })
+
+                let total_begin = Instant::now();
+                let (snapshot, serialize_duration) =
+                    measure_ok(|| vm.snapshot()).map_err(VmError::Snapshot)?;
+                // Harvest dirty pages after the device snapshot so its side
+                // effects land in the delta.
+                let (diff_ranges, harvest_duration) = if config.diff {
+                    let (ranges, duration) =
+                        measure_ok(|| vm.dirty_log()).map_err(VmError::Snapshot)?;
+                    (Some(ranges), duration)
+                } else {
+                    (None, Duration::ZERO)
+                };
+                let send_config = SnapshotSendConfig {
+                    destination_url: config.destination_url.clone(),
+                    diff_ranges,
+                    memory_file_path: config.memory_file_path.as_ref().map(PathBuf::from),
+                };
+                let ((), write_duration) = measure_ok(|| vm.send(&snapshot, &send_config))
+                    .map_err(VmError::SnapshotSend)?;
+
+                info!(
+                    "Snapshot completed: {}",
+                    snapshot_log(
+                        config,
+                        serialize_duration,
+                        harvest_duration,
+                        send_config
+                            .diff_ranges
+                            .as_ref()
+                            .map(MemoryRangeTable::effective_size),
+                        write_duration,
+                        total_begin.elapsed(),
+                    )
+                );
+                Ok(())
             }
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => Err(VmError::VmNotRunning),
@@ -2784,6 +2857,11 @@ impl RequestHandler for Vmm {
                     restore_cfg.memory_restore_mode,
                 )
                 .and_then(|()| {
+                    if restore_cfg.start_dirty_log == Some(true)
+                        && let VmOwnership::Owned(ref mut vm) = self.vm
+                    {
+                        vm.start_dirty_log().map_err(VmError::Snapshot)?;
+                    }
                     if restore_cfg.resume {
                         self.vm_resume()
                     } else {
@@ -2944,11 +3022,15 @@ impl RequestHandler for Vmm {
             VmOwnership::Migration { .. } => unreachable!("migration path is handled above"),
         };
 
+        let dirty_log_enabled =
+            matches!(&self.vm, VmOwnership::Owned(vm) if vm.dirty_log_enabled());
+
         Ok(VmInfoResponse {
             config: Box::new(vm_config),
             state,
             memory_actual_size,
             device_tree,
+            dirty_log_enabled,
         })
     }
 
@@ -3070,6 +3152,10 @@ impl RequestHandler for Vmm {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
         match self.vm {
+            // Memory resize changes memslots; the dirty bitmap becomes invalid.
+            VmOwnership::Owned(ref vm) if desired_ram.is_some() && vm.dirty_log_enabled() => {
+                Err(VmError::ResizeWithDirtyLogEnabled)
+            }
             VmOwnership::Owned(ref mut vm) => vm
                 .resize(desired_vcpus, desired_ram, desired_balloon)
                 .inspect_err(|e| error!("Error when resizing VM: {e:?}")),
@@ -3107,6 +3193,11 @@ impl RequestHandler for Vmm {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
         match self.vm {
+            // Memory zone resize changes memslots; the dirty bitmap becomes
+            // invalid.
+            VmOwnership::Owned(ref vm) if vm.dirty_log_enabled() => {
+                Err(VmError::ResizeWithDirtyLogEnabled)
+            }
             VmOwnership::Owned(ref mut vm) => {
                 vm.resize_zone(&id, desired_ram)
                     .inspect_err(|e| error!("Error when resizing zone: {e:?}"))?;
@@ -3563,6 +3654,12 @@ impl RequestHandler for Vmm {
                 if vm.restoring() {
                     return Err(MigratableError::Conflict(anyhow!(
                         "An on-demand memory restore is still in progress"
+                    )));
+                }
+                if vm.dirty_log_enabled() {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Dirty log tracking is enabled; stop incremental snapshots \
+                         (resume with start_dirty_log=false) before migration"
                     )));
                 }
             }

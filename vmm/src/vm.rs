@@ -83,7 +83,8 @@ use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, snapshot_from_id,
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotSendConfig, Snapshottable,
+    Transportable, snapshot_from_id,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -224,6 +225,12 @@ pub enum Error {
 
     #[error("Cannot snapshot VM")]
     Snapshot(#[source] MigratableError),
+
+    #[error("Cannot snapshot VM with diff=true because dirty log is not enabled")]
+    DiffSnapshotDirtyLogDisabled,
+
+    #[error("Cannot resize memory while dirty log is enabled")]
+    ResizeWithDirtyLogEnabled,
 
     #[error("Cannot restore VM")]
     Restore(#[source] MigratableError),
@@ -561,6 +568,9 @@ pub struct Vm {
     numa_nodes: NumaNodes,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
+    /// Whether dirty log tracking is enabled.
+    /// Maintained by start_dirty_log()/stop_dirty_log().
+    dirty_log_enabled: bool,
 }
 
 impl Vm {
@@ -743,6 +753,7 @@ impl Vm {
             numa_nodes,
             stop_on_boot,
             load_payload_handle,
+            dirty_log_enabled: false,
         })
     }
 
@@ -3116,6 +3127,11 @@ impl Vm {
         self.memory_manager.lock().unwrap().restoring()
     }
 
+    /// Whether dirty log tracking is currently enabled.
+    pub fn dirty_log_enabled(&self) -> bool {
+        self.dirty_log_enabled
+    }
+
     pub fn device_tree(&self) -> Arc<Mutex<DeviceTree>> {
         self.device_manager.lock().unwrap().device_tree()
     }
@@ -3446,8 +3462,9 @@ impl Transportable for Vm {
     fn send(
         &self,
         snapshot: &Snapshot,
-        destination_url: &str,
+        config: &SnapshotSendConfig,
     ) -> result::Result<(), MigratableError> {
+        let destination_url = config.destination_url.as_str();
         let mut snapshot_config_path = url_to_path(destination_url)?;
         snapshot_config_path.push(SNAPSHOT_CONFIG_FILE);
 
@@ -3497,7 +3514,7 @@ impl Transportable for Vm {
             self.memory_manager
                 .lock()
                 .unwrap()
-                .send(&memory_manager_snapshot.clone(), destination_url)?;
+                .send(&memory_manager_snapshot.clone(), config)?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
                 "Missing memory manager snapshot"
@@ -3511,12 +3528,16 @@ impl Transportable for Vm {
 impl Migratable for Vm {
     fn start_dirty_log(&mut self) -> result::Result<(), MigratableError> {
         self.memory_manager.lock().unwrap().start_dirty_log()?;
-        self.device_manager.lock().unwrap().start_dirty_log()
+        self.device_manager.lock().unwrap().start_dirty_log()?;
+        self.dirty_log_enabled = true;
+        Ok(())
     }
 
     fn stop_dirty_log(&mut self) -> result::Result<(), MigratableError> {
         self.memory_manager.lock().unwrap().stop_dirty_log()?;
-        self.device_manager.lock().unwrap().stop_dirty_log()
+        self.device_manager.lock().unwrap().stop_dirty_log()?;
+        self.dirty_log_enabled = false;
+        Ok(())
     }
 
     fn dirty_log(&mut self) -> result::Result<MemoryRangeTable, MigratableError> {

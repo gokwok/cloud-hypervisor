@@ -229,6 +229,8 @@ pub struct VmInfoResponse {
     pub state: VmState,
     pub memory_actual_size: u64,
     pub device_tree: Option<DeviceTree>,
+    /// Whether dirty log tracking is enabled.
+    pub dirty_log_enabled: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -282,6 +284,13 @@ pub struct VmRemoveDeviceData {
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
+    /// Whether to produce a diff snapshot (dirty pages only).
+    #[serde(default)]
+    pub diff: bool,
+    /// Custom memory file path; defaults to <destination_url>/memory-ranges
+    /// (full) or <destination_url>/memory-ranges.diff (diff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_file_path: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -899,13 +908,13 @@ pub type ApiResponse = Result<ApiResponsePayload, ApiError>;
 pub trait RequestHandler {
     fn vm_create(&mut self, config: Box<VmConfig>) -> Result<(), VmError>;
 
-    fn vm_boot(&mut self) -> Result<(), VmError>;
+    fn vm_boot(&mut self, data: Option<VmBootData>) -> Result<(), VmError>;
 
     fn vm_pause(&mut self) -> Result<(), VmError>;
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+    fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -1382,18 +1391,26 @@ impl ApiAction for VmAddUserDevice {
     }
 }
 
+/// Optional body for `PUT /api/v1/vm.boot`.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VmBootData {
+    /// Whether to enable dirty log tracking before booting.
+    #[serde(default)]
+    pub start_dirty_log: bool,
+}
+
 pub struct VmBoot;
 
 impl ApiAction for VmBoot {
-    type RequestBody = ();
+    type RequestBody = Option<VmBootData>;
     type ResponseBody = Option<Body>;
 
-    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+    fn request(&self, data: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
         Box::new(move |vmm| {
             info!("API request event: VmBoot");
 
             let response = vmm
-                .vm_boot()
+                .vm_boot(data)
                 .map_err(ApiError::VmBoot)
                 .map(|_| ApiResponsePayload::Empty);
 
@@ -2104,7 +2121,7 @@ impl ApiAction for VmSnapshot {
             info!("API request event: VmSnapshot {config:?}");
 
             let response = vmm
-                .vm_snapshot(&config.destination_url)
+                .vm_snapshot(&config)
                 .map_err(ApiError::VmSnapshot)
                 .map(|_| ApiResponsePayload::Empty);
 
