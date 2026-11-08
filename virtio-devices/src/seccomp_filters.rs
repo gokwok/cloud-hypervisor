@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use block::{BLKDISCARD, BLKZEROOUT};
 use libc::{FIONBIO, TIOCGWINSZ, TUNSETOFFLOAD, TUNSETQUEUE};
@@ -14,7 +15,7 @@ use seccompiler::{
     SeccompFilter, SeccompRule,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Thread {
     VirtioBalloon,
     VirtioBlock,
@@ -408,7 +409,7 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
 }
 
 /// Generate a BPF program based on the seccomp_action value
-pub fn get_seccomp_filter(
+fn build_seccomp_filter(
     seccomp_action: &SeccompAction,
     thread_type: Thread,
 ) -> Result<BpfProgram, Error> {
@@ -422,5 +423,70 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+struct CachedFilter {
+    action: SeccompAction,
+    thread: Thread,
+    program: Arc<BpfProgram>,
+}
+
+/// Upper bound on cached programs. Actions may carry caller-supplied errno
+/// values, so growth is bounded without evicting programs workers still hold.
+const FILTER_CACHE_LIMIT: usize = 64;
+
+static FILTER_CACHE: OnceLock<Mutex<Vec<CachedFilter>>> = OnceLock::new();
+
+/// Return the compiled program for `thread`, compiling it once per process.
+pub(crate) fn get_cached_seccomp_filter(
+    action: &SeccompAction,
+    thread: Thread,
+) -> Result<Arc<BpfProgram>, Error> {
+    let mut cache = FILTER_CACHE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    if let Some(entry) = cache
+        .iter()
+        .find(|entry| entry.action == *action && entry.thread == thread)
+    {
+        return Ok(Arc::clone(&entry.program));
+    }
+    let program = Arc::new(build_seccomp_filter(action, thread)?);
+    if cache.len() < FILTER_CACHE_LIMIT {
+        cache.push(CachedFilter {
+            action: action.clone(),
+            thread,
+            program: Arc::clone(&program),
+        });
+    }
+    Ok(program)
+}
+
+/// Generate a device filter, reusing an immutable compiled program when possible.
+pub fn get_seccomp_filter(action: &SeccompAction, thread: Thread) -> Result<BpfProgram, Error> {
+    get_cached_seccomp_filter(action, thread).map(|program| program.as_ref().clone())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cached_program_preserves_compiler_output_and_action() {
+        for action in [SeccompAction::Trap, SeccompAction::Allow] {
+            let first = get_cached_seccomp_filter(&action, Thread::VirtioVsock).unwrap();
+            let second = get_cached_seccomp_filter(&action, Thread::VirtioVsock).unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+            let expected = build_seccomp_filter(&action, Thread::VirtioVsock).unwrap();
+            assert_eq!(first.len(), expected.len());
+            for (actual, expected) in first.iter().zip(&expected) {
+                assert_eq!(
+                    (actual.code, actual.jt, actual.jf, actual.k),
+                    (expected.code, expected.jt, expected.jf, expected.k)
+                );
+            }
+        }
     }
 }

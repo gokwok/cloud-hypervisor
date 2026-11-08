@@ -15,7 +15,7 @@ use seccompiler::{SeccompAction, apply_filter};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::epoll_helper::EpollHelperError;
-use crate::seccomp_filters::{Thread, get_seccomp_filter};
+use crate::seccomp_filters::{Thread, get_cached_seccomp_filter};
 use crate::thread_name::set_logical_thread_name;
 use crate::{ActivateError, VirtioInterrupt, mark_device_needs_reset};
 
@@ -157,7 +157,7 @@ where
     F: FnOnce() -> result::Result<(), EpollHelperError>,
     F: Send + 'static,
 {
-    let seccomp_filter = get_seccomp_filter(seccomp_action, thread_type)
+    let seccomp_filter = get_cached_seccomp_filter(seccomp_action, thread_type)
         .map_err(ActivateError::CreateSeccompFilter)?;
 
     let thread_exit_evt = exit_evt.try_clone().map_err(ActivateError::CloneEventFd)?;
