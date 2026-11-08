@@ -1021,7 +1021,8 @@ impl MemoryManager {
             .map_err(Error::SnapshotOpen)?;
         // A range mapped past EOF faults SIGBUS at run time, not restore time.
         let mapped_len: u64 = saved_regions.ranges().iter().map(|r| r.length).sum();
-        let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
+        // Block devices report a zero file size; query their capacity instead.
+        let (file_len, _) = block::query_device_size(&memory_file).map_err(Error::SnapshotOpen)?;
         if file_len < mapped_len {
             return Err(Error::SnapshotMmap(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

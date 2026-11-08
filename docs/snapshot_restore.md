@@ -183,8 +183,9 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
   page-aligned single-region extents. Each region's `reserve` policy and the
   THP policy are re-applied to the mapped region.
-- A snapshot memory file shorter than the saved ranges is rejected up front (it
-  would otherwise fault `SIGBUS` at run time).
+- A snapshot memory file or block device shorter than the saved ranges is
+  rejected up front (it would otherwise fault `SIGBUS` at run time). A block
+  device's capacity is queried, since its file size reads as zero.
 - `prefault` is rejected.
 - The snapshot memory file must remain on disk **and unchanged** for the
   entire lifetime of the VM. This is stronger than `ondemand`: UFFD copies each
