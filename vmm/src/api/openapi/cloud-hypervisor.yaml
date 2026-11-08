@@ -1716,6 +1716,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/VmMemoryZoneUpdateData"
+        memory_file_path:
+          type: string
+          description: >
+            Filesystem path of the snapshot memory file. Defaults to
+            `<source_url>/memory-ranges` when absent.
 
     ReceiveMigrationData:
       required:

@@ -3007,6 +3007,10 @@ pub struct RestoreConfig {
     pub resume: bool,
     #[serde(default)]
     pub zone_updates: Vec<VmMemoryZoneUpdateData>,
+    /// Filesystem path of the snapshot memory file. Defaults to
+    /// `<source_url>/memory-ranges` when absent.
+    #[serde(default)]
+    pub memory_file_path: Option<PathBuf>,
 }
 
 impl RestoreConfig {
@@ -3014,7 +3018,7 @@ impl RestoreConfig {
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
         net_fds=<list_of_net_ids_with_their_associated_fds>,\
         vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
-        zone_updates=<list_of_updates>\"
+        zone_updates=<list_of_updates>,memory_file_path=<path>\"
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
@@ -3026,7 +3030,8 @@ impl RestoreConfig {
         \n`iommufd_fd` is a new iommufd file descriptor for the restored VM. \
         The one saved in the snapshot does not survive serialization.\
         \n `resume` controls whether the VM will be directly resumed after restore \
-        \n `zone_updates` can be used to update NUMA memory zones. Expects a list of elements in the form `id@host_numa_node`";
+        \n `zone_updates` can be used to update NUMA memory zones. Expects a list of elements in the form `id@host_numa_node` \
+        \n `memory_file_path` is the filesystem path of the snapshot memory file, overriding the default <source_url>/memory-ranges";
 
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -3038,7 +3043,8 @@ impl RestoreConfig {
             .add("vfio_fds")
             .add("iommufd_fd")
             .add("resume")
-            .add("zone_updates");
+            .add("zone_updates")
+            .add("memory_file_path");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
         let source_url = parser
@@ -3098,6 +3104,8 @@ impl RestoreConfig {
                     .collect()
             });
 
+        let memory_file_path = parser.get("memory_file_path").map(PathBuf::from);
+
         Ok(RestoreConfig {
             source_url,
             prefault,
@@ -3107,6 +3115,7 @@ impl RestoreConfig {
             iommufd_fd,
             resume,
             zone_updates,
+            memory_file_path,
         })
     }
 
@@ -5517,6 +5526,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 iommufd_fd: None,
                 resume: false,
                 zone_updates: vec![],
+                memory_file_path: None,
             }
         );
         assert_eq!(
@@ -5543,6 +5553,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 iommufd_fd: None,
                 resume: false,
                 zone_updates: vec![],
+                memory_file_path: None,
             }
         );
         assert_eq!(
@@ -5556,6 +5567,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 iommufd_fd: None,
                 resume: false,
                 zone_updates: vec![],
+                memory_file_path: None,
             }
         );
         assert_eq!(
@@ -5572,6 +5584,23 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     host_numa_node: 1,
                     id: "zone1".to_string(),
                 }],
+                memory_file_path: None,
+            }
+        );
+        assert_eq!(
+            RestoreConfig::parse(
+                "source_url=/path/to/snapshot,memory_file_path=/data/mem/memory-ranges.bin"
+            )?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode: MemoryRestoreMode::Copy,
+                net_fds: None,
+                vfio_fds: None,
+                iommufd_fd: None,
+                resume: false,
+                zone_updates: vec![],
+                memory_file_path: Some(PathBuf::from("/data/mem/memory-ranges.bin")),
             }
         );
         assert_eq!(
@@ -5596,6 +5625,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 iommufd_fd: Some(7),
                 resume: false,
                 zone_updates: vec![],
+                memory_file_path: None,
             }
         );
         assert_eq!(
@@ -5620,6 +5650,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 iommufd_fd: Some(7),
                 resume: false,
                 zone_updates: vec![],
+                memory_file_path: None,
             }
         );
         // Parsing should fail as source_url is a required field
@@ -5787,6 +5818,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             iommufd_fd: None,
             resume: false,
             zone_updates: vec![],
+            memory_file_path: None,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
@@ -5855,6 +5887,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             iommufd_fd: None,
             resume: false,
             zone_updates: vec![],
+            memory_file_path: None,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             pci_common: PciDeviceCommonConfig {
@@ -5875,6 +5908,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             iommufd_fd: None,
             resume: false,
             zone_updates: vec![],
+            memory_file_path: None,
         };
         assert_eq!(
             invalid_restore_mode.validate(&snapshot_vm_config),
@@ -5918,6 +5952,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             iommufd_fd: None,
             resume: false,
             zone_updates: vec![],
+            memory_file_path: None,
         };
         assert_eq!(
             invalid_cow_prefault.validate(&snapshot_vm_config),
@@ -5993,6 +6028,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             iommufd_fd: Some(6),
             resume: false,
             zone_updates: vec![],
+            memory_file_path: None,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 

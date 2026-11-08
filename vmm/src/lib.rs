@@ -8,7 +8,6 @@ use std::fs::File;
 use std::io::{Read, Write, stdout};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
-#[cfg(feature = "guest_debug")]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "guest_debug")]
@@ -2082,6 +2081,7 @@ impl Vmm {
         &mut self,
         source_url: &str,
         vm_config: Arc<Mutex<VmConfig>>,
+        memory_file_path: Option<PathBuf>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
     ) -> result::Result<(), VmError> {
@@ -2134,6 +2134,7 @@ impl Vmm {
                     Arc::clone(&self.original_termios_opt),
                     Some(&snapshot),
                     Some(source_url),
+                    memory_file_path,
                     Some(prefault),
                     Some(memory_restore_mode),
                 )?;
@@ -2583,6 +2584,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2723,6 +2725,7 @@ impl RequestHandler for Vmm {
                 self.vm_restore(
                     source_url,
                     vm_config,
+                    restore_cfg.memory_file_path,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
                 )
@@ -2830,6 +2833,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,

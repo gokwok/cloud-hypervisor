@@ -2254,14 +2254,23 @@ impl MemoryManager {
         vm: Arc<dyn hypervisor::Vm>,
         config: &MemoryConfig,
         source_url: Option<&str>,
+        memory_file_path: Option<PathBuf>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
         phys_bits: u8,
         exit_evt: &EventFd,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
-            let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
-            memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+            // An explicit path wins; otherwise the memory file lives next to
+            // the rest of the snapshot state.
+            let memory_file_path = match memory_file_path {
+                Some(path) => path,
+                None => {
+                    let mut path = url_to_path(source_url).map_err(Error::Restore)?;
+                    path.push(String::from(SNAPSHOT_FILENAME));
+                    path
+                }
+            };
 
             let mem_snapshot: MemoryManagerSnapshotData =
                 snapshot.to_state().map_err(Error::Restore)?;

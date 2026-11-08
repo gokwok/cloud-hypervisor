@@ -116,6 +116,20 @@ Restore also supports selecting how guest memory is populated:
 If `memory_restore_mode` is omitted, Cloud Hypervisor uses the eager-copy
 restore path (`copy`).
 
+By default the guest memory is restored from `memory-ranges` inside the snapshot
+directory. When the memory file lives elsewhere — for example when the snapshot
+wrote it to a dedicated directory or a block device — pass `memory_file_path` to
+restore from that location instead:
+
+```bash
+./cloud-hypervisor \
+    --api-socket /tmp/cloud-hypervisor.sock \
+    --restore source_url=file:///home/foo/snapshot,memory_file_path=/data/mem/memory-ranges
+```
+
+The value is a filesystem path naming the memory file itself, not its directory.
+The option applies to all restore modes.
+
 With `memory_restore_mode=ondemand`, restore uses `userfaultfd` to fault snapshot
 pages in on first access instead of copying the full `memory-ranges` file into
 guest RAM before restore completes. This mode is strict: if Cloud Hypervisor

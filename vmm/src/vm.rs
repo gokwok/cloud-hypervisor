@@ -19,6 +19,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
@@ -1350,6 +1351,7 @@ impl Vm {
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
         source_url: Option<&str>,
+        memory_file_path: Option<PathBuf>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
     ) -> Result<Self> {
@@ -1415,6 +1417,7 @@ impl Vm {
                     Arc::clone(&vm),
                     &vm_config.lock().unwrap().memory.clone(),
                     source_url,
+                    memory_file_path,
                     prefault.unwrap_or(false),
                     memory_restore_mode,
                     phys_bits,
