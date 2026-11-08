@@ -33,7 +33,7 @@ use crate::api::{
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCancelMigration, VmCounters,
     VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice,
     VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown,
-    VmSnapshot,
+    VmSnapshot, VmmPrepare, VmmQueryPrepare,
 };
 use crate::config::ValidationError;
 use crate::device_manager::DeviceManagerError;
@@ -346,6 +346,14 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     );
     r.routes
         .insert(endpoint!("/vmm.ping"), Box::new(VmmPing {}));
+    r.routes.insert(
+        endpoint!("/vmm.prepare"),
+        Box::new(VmActionHandler::new(&VmmPrepare)),
+    );
+    r.routes.insert(
+        endpoint!("/vmm.query_prepare"),
+        Box::new(VmActionHandler::new(&VmmQueryPrepare)),
+    );
     r.routes
         .insert(endpoint!("/vmm.shutdown"), Box::new(VmmShutdown {}));
     r.routes

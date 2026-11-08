@@ -22,6 +22,60 @@ paths:
               schema:
                 $ref: "#/components/schemas/VmmPingResponse"
 
+  /vmm.prepare:
+    put:
+      summary: Pre-create resources in an idle VMM
+      operationId: prepareVMM
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                pre_vm:
+                  type: boolean
+                  default: true
+                pre_threads:
+                  type: integer
+                  minimum: 0
+                  maximum: 16
+                  default: 0
+      responses:
+        200:
+          description: Resources prepared
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pre_vm, pre_threads]
+                properties:
+                  pre_vm:
+                    type: boolean
+                  pre_threads:
+                    type: integer
+        500:
+          description: Preparation failed
+
+  /vmm.query_prepare:
+    get:
+      summary: Query the current VMM preparation status
+      operationId: queryPrepareVMM
+      responses:
+        200:
+          description: Current preparation status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pre_vm, pre_threads]
+                properties:
+                  pre_vm:
+                    type: boolean
+                  pre_threads:
+                    type: integer
+
   /vmm.shutdown:
     put:
       summary: Shuts the cloud-hypervisor VMM.
@@ -643,6 +697,11 @@ components:
           type: integer
           format: int64
         features:
+          type: array
+          items:
+            type: string
+        prepare:
+          description: Optional prepare capability advertisement. Each entry names a field accepted by PUT /vmm.prepare.
           type: array
           items:
             type: string

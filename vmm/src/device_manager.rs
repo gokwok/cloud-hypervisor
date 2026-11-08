@@ -153,6 +153,7 @@ use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::locked_unix_listener::LockedUnixListener;
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
+use crate::prepare::PreparedDeviceWorkerPool;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 use crate::sev::SevSnpSharedPageTracker;
@@ -1111,6 +1112,10 @@ pub struct DeviceManager {
     // Pending activations
     pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
 
+    // Pre-created worker threads from vmm.prepare. An empty pool means
+    // nothing was prepared, which activates devices the same way as no pool.
+    prepared_workers: PreparedDeviceWorkerPool,
+
     // Addresses for ACPI platform devices e.g. ACPI PM timer, sleep/reset registers
     acpi_platform_addresses: AcpiPlatformAddresses,
 
@@ -1212,6 +1217,7 @@ impl DeviceManager {
         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
         snapshot: Option<&Snapshot>,
         dynamic: bool,
+        prepared_workers: PreparedDeviceWorkerPool,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         trace_scoped!("DeviceManager::new");
 
@@ -1447,6 +1453,7 @@ impl DeviceManager {
             #[cfg(not(target_arch = "riscv64"))]
             timestamp,
             pending_activations: Arc::new(Mutex::new(Vec::default())),
+            prepared_workers,
             acpi_platform_addresses: AcpiPlatformAddresses::default(),
             rate_limit_groups,
             mmio_regions: Arc::new(Mutex::new(Vec::new())),
@@ -5017,6 +5024,7 @@ impl DeviceManager {
                 dma_handler,
                 Arc::clone(&self.pending_activations),
                 vm_migration::snapshot_from_id(snapshot, id.as_str()),
+                Arc::clone(&self.prepared_workers),
             )
             .map_err(DeviceManagerError::VirtioDevice)?,
         ));

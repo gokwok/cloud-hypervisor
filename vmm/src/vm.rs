@@ -109,6 +109,7 @@ use crate::memory_manager::{
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
 use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path};
+use crate::prepare::{Preparation, PreparedDeviceWorkerPool};
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 use crate::sev::MeasuredBootInfo;
 #[cfg(feature = "fw_cfg")]
@@ -125,6 +126,10 @@ use crate::{
 /// Errors associated with VM management
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Idle resource preparation failed.
+    #[error("Error preparing idle VMM")]
+    Prepare(#[source] anyhow::Error),
+
     #[error("Cannot open kernel file")]
     KernelFile(#[source] io::Error),
 
@@ -593,6 +598,7 @@ impl Vm {
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
+        prepared_workers: PreparedDeviceWorkerPool,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
 
@@ -662,6 +668,7 @@ impl Vm {
             #[cfg(not(target_arch = "riscv64"))]
             timestamp,
             snapshot,
+            prepared_workers,
         )?;
 
         // Perform hypervisor-specific initialization
@@ -856,6 +863,7 @@ impl Vm {
         boot_id_list: BTreeSet<String>,
         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
         snapshot: Option<&Snapshot>,
+        prepared_workers: PreparedDeviceWorkerPool,
     ) -> Result<Arc<Mutex<DeviceManager>>> {
         #[cfg(feature = "tdx")]
         let dynamic = !config.lock().unwrap().is_tdx_enabled();
@@ -881,6 +889,7 @@ impl Vm {
             timestamp,
             snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
             dynamic,
+            prepared_workers,
         )
         .map_err(Error::DeviceManager)
     }
@@ -1354,6 +1363,8 @@ impl Vm {
         memory_file_path: Option<PathBuf>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        precreated_vm: Option<Arc<dyn hypervisor::Vm>>,
+        prepared_workers: PreparedDeviceWorkerPool,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1387,7 +1398,10 @@ impl Vm {
             if let Some(ref igvm) = igvm_file {
                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
             }
-            Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
+            match precreated_vm {
+                Some(vm) if Preparation::compatible(&hv_config) => vm,
+                _ => Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?,
+            }
         };
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1458,6 +1472,7 @@ impl Vm {
             snapshot,
             #[cfg(feature = "igvm")]
             igvm_file,
+            prepared_workers,
         )
     }
 

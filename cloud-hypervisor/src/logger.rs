@@ -12,6 +12,7 @@ use std::{mem, process, thread};
 
 use jiff::tz::TimeZone;
 use thiserror::Error;
+use vmm::thread_name::logical_thread_name;
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -238,10 +239,15 @@ impl log::Log for Logger {
                 Token::Pid => write!(&mut *out, "{}", self.pid),
                 // SAFETY: gettid(2) always succeeds
                 Token::Tid => write!(&mut *out, "{}", unsafe { libc::gettid() }),
+                // A thread renamed at run time (e.g. a pre-created worker taking a
+                // device job) records its logical name, since the Rust thread name is
+                // fixed at spawn time and cannot be updated.
                 Token::Thread => write!(
                     &mut *out,
                     "{}",
-                    thread::current().name().unwrap_or("anonymous")
+                    logical_thread_name()
+                        .or_else(|| thread::current().name().map(String::from))
+                        .unwrap_or_else(|| "anonymous".to_string())
                 ),
                 Token::Level => write!(&mut *out, "{}", record.level()),
                 Token::LevelChar => write!(&mut *out, "{}", level_char(record.level())),

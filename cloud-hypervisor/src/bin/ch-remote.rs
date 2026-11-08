@@ -20,10 +20,11 @@ use api_client::{
 use clap::ArgAction;
 use clap::{Arg, ArgMatches, Command};
 use log::error;
-use option_parser::{ByteSized, ByteSizedParseError};
+use option_parser::{ByteSized, ByteSizedParseError, OptionParserError};
 use thiserror::Error;
 use vmm::api;
 use vmm::config::{self, RestoreConfig};
+use vmm::prepare::PrepareSpec;
 use vmm::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VsockConfig,
@@ -42,6 +43,8 @@ enum Error {
     DBusApiClient(#[source] zbus::Error),
     #[error("Error parsing CPU count")]
     InvalidCpuCount(#[source] num::ParseIntError),
+    #[error("Error parsing prepare config")]
+    InvalidPrepareConfig(#[source] OptionParserError),
     #[error("Error parsing memory size")]
     InvalidMemorySize(#[source] ByteSizedParseError),
     #[error("Error parsing balloon size")]
@@ -330,6 +333,17 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
         Some("ping") => {
             simple_api_full_command(socket, "GET", "vmm.ping", None).map_err(Error::HttpApiClient)
         }
+        Some("prepare") => {
+            let config_str = matches
+                .subcommand_matches("prepare")
+                .and_then(|m| m.get_one::<String>("prepare_config"))
+                .map_or("", String::as_str);
+            let data = prepare_data(config_str)?;
+            simple_api_full_command(socket, "PUT", "vmm.prepare", Some(&data))
+                .map_err(Error::HttpApiClient)
+        }
+        Some("query-prepare") => simple_api_full_command(socket, "GET", "vmm.query_prepare", None)
+            .map_err(Error::HttpApiClient),
         Some("shutdown") => {
             simple_api_command(socket, "PUT", "shutdown", None).map_err(Error::HttpApiClient)
         }
@@ -1019,6 +1033,11 @@ fn create_data(path: &str) -> Result<String, Error> {
     Ok(data)
 }
 
+fn prepare_data(config: &str) -> Result<String, Error> {
+    let config = PrepareSpec::parse(config).map_err(Error::InvalidPrepareConfig)?;
+    Ok(serde_json::to_string(&config).unwrap())
+}
+
 /// Returns all [`Arg`]s in alphabetical order.
 ///
 /// This is the order used in the `--help` output.
@@ -1107,6 +1126,14 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
         Command::new("pause").about("Pause the VM"),
         Command::new("ping").about("Ping the VMM to check for API server availability"),
         Command::new("power-button").about("Trigger a power button in the VM"),
+        Command::new("prepare")
+            .about("Pre-create KVM VM and worker threads in an idle VMM")
+            .arg(
+                Arg::new("prepare_config")
+                    .index(1)
+                    .help(PrepareSpec::SYNTAX),
+            ),
+        Command::new("query-prepare").about("Query the current VMM preparation status"),
         Command::new("reboot").about("Reboot the VM"),
         Command::new("receive-migration")
             .about("Receive a VM migration")

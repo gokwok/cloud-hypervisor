@@ -53,7 +53,8 @@ use crate::api::{
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
     VmCancelMigration, VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot,
     VmReceiveMigration, VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPrepare,
+    VmmQueryPrepare,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -463,6 +464,7 @@ macro_rules! vm_action_put_handler_body {
 }
 
 vm_action_get_handler!(VmCounters);
+vm_action_get_handler!(VmmQueryPrepare);
 
 vm_action_put_handler!(VmBoot);
 vm_action_put_handler!(VmDelete);
@@ -473,6 +475,8 @@ vm_action_put_handler!(VmResume);
 vm_action_put_handler!(VmPowerButton);
 vm_action_put_handler!(VmNmi);
 vm_action_put_handler!(VmCancelMigration);
+
+vm_action_put_handler_body!(VmmPrepare);
 
 vm_action_put_handler_body!(AddDisk);
 vm_action_put_handler_body!(VmAddFs);

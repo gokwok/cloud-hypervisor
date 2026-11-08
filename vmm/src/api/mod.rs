@@ -61,6 +61,7 @@ use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
+use crate::prepare::PrepareConfig;
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
@@ -70,6 +71,14 @@ use crate::vm_config::{
 /// API errors are sent back from the VMM API server through the ApiResponse.
 #[derive(Error, Debug)]
 pub enum ApiError {
+    /// Idle resource preparation failed.
+    #[error("Error preparing VMM")]
+    VmmPrepare(#[source] VmError),
+
+    /// Idle resource preparation query failed.
+    #[error("Error querying VMM preparation")]
+    VmmQueryPrepare(#[source] VmError),
+
     /// Cannot write to EventFd.
     #[error("Cannot write to EventFd")]
     EventFdWrite(#[source] io::Error),
@@ -235,6 +244,10 @@ pub struct VmmPingResponse {
     pub version: String,
     pub pid: i64,
     pub features: Vec<String>,
+    /// Prepare capability advertisement. Each entry names a field accepted by
+    /// `PUT /api/v1/vmm.prepare`. Empty means the backend does not support
+    /// preparation.
+    pub prepare: Vec<String>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -908,6 +921,10 @@ pub trait RequestHandler {
     fn vm_balloon_stats(&self) -> Result<BalloonStatsResponse, VmError>;
 
     fn vmm_ping(&self) -> VmmPingResponse;
+
+    fn vmm_prepare(&mut self, config: PrepareConfig) -> Result<Vec<u8>, VmError>;
+
+    fn vmm_query_prepare(&self) -> Result<Vec<u8>, VmError>;
 
     fn vm_delete(&mut self) -> Result<(), VmError>;
 
@@ -2141,6 +2158,76 @@ impl ApiAction for VmmPing {
             ApiResponsePayload::VmmPing(pong) => Ok(pong),
             _ => Err(ApiError::ResponsePayloadType),
         }
+    }
+}
+
+pub struct VmmPrepare;
+
+impl ApiAction for VmmPrepare {
+    type RequestBody = PrepareConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmmPrepare");
+
+            let response = vmm
+                .vmm_prepare(config)
+                .map(|body| ApiResponsePayload::VmAction(Some(body)))
+                .map_err(ApiError::VmmPrepare);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmmQueryPrepare;
+
+impl ApiAction for VmmQueryPrepare {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmmQueryPrepare");
+
+            let response = vmm
+                .vmm_query_prepare()
+                .map(|body| ApiResponsePayload::VmAction(Some(body)))
+                .map_err(ApiError::VmmQueryPrepare);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
     }
 }
 

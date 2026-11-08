@@ -67,6 +67,7 @@ use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
 };
 use crate::migration::{recv_vm_config, recv_vm_state};
+use crate::prepare::{Preparation, PrepareConfig, PrepareResponse};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::util::flatten_error_chain_to_string;
 use crate::vm::{Error as VmError, Vm, VmState};
@@ -96,7 +97,13 @@ pub mod memory_manager;
 pub mod migration;
 mod pci_segment;
 mod prefault;
+pub mod prepare;
 pub mod seccomp_filters;
+/// Logical thread names for threads that record their name after spawn.
+///
+/// Re-exported so the binary crate, which does not depend on
+/// `virtio-devices` directly, can honour the name in its log formatter.
+pub use virtio_devices::thread_name;
 mod serial_manager;
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 pub(crate) mod sev;
@@ -405,6 +412,14 @@ pub fn feature_list() -> Vec<String> {
     ]
 }
 
+pub fn prepare_list(hypervisor: &dyn hypervisor::Hypervisor) -> Vec<String> {
+    if Preparation::supported(hypervisor) {
+        vec!["pre_vm".to_string(), "pre_threads".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn start_event_monitor_thread(
     mut monitor: event_monitor::Monitor,
     seccomp_action: &SeccompAction,
@@ -710,6 +725,13 @@ pub struct Vmm {
     vm_config: Option<Arc<Mutex<VmConfig>>>,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    /// Pre-created resources held during idle phase; consumed by the next
+    /// VM boot or restore, discarded by `vm.delete`.
+    ///
+    /// An empty value (no VM, empty worker pool) means "not prepared". The
+    /// worker pool handle is kept after the VM takes over so
+    /// `vmm.query_prepare` can report the remaining count.
+    preparation: Preparation,
     activate_evt: EventFd,
     signals: Option<Handle>,
     threads: Vec<thread::JoinHandle<()>>,
@@ -948,6 +970,7 @@ impl Vmm {
             vm_config: None,
             seccomp_action,
             hypervisor,
+            preparation: Preparation::default(),
             activate_evt,
             signals: None,
             threads: vec![],
@@ -1461,6 +1484,7 @@ impl Vmm {
                 Some(&snapshot),
                 #[cfg(feature = "igvm")]
                 None,
+                Default::default(),
             )
             .map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Error creating VM from snapshot: {e:?}"))
@@ -2077,6 +2101,29 @@ impl Vmm {
             .map_err(MigratableError::MigrateReceive)
     }
 
+    /// Hand the idle preparation to a VM about to be created.
+    ///
+    /// The pre-created hypervisor VM is consumed and the worker pool is
+    /// shared; the VMM keeps its pool handle so `vmm.query_prepare` keeps
+    /// reporting the workers still available after devices took some.
+    fn take_preparation(
+        &mut self,
+        vm_config: &Arc<Mutex<VmConfig>>,
+    ) -> (
+        Option<Arc<dyn hypervisor::Vm>>,
+        prepare::PreparedDeviceWorkerPool,
+    ) {
+        let precreated_vm = self.preparation.vm.take();
+        // Landlock restrictions cannot be inherited by pre-created threads,
+        // so devices must spawn their own. Drop the VMM's handle as well:
+        // keeping it would leave every worker blocked on its channel for the
+        // whole VM lifetime and keep query_prepare reporting them as usable.
+        if vm_config.lock().unwrap().landlock_enable {
+            self.preparation.workers = Default::default();
+        }
+        (precreated_vm, Arc::clone(&self.preparation.workers))
+    }
+
     fn vm_restore(
         &mut self,
         source_url: &str,
@@ -2119,6 +2166,8 @@ impl Vmm {
                     .try_clone()
                     .map_err(VmError::EventFdClone)?;
 
+                let (precreated_vm, prepared_workers) = self.take_preparation(&vm_config);
+
                 let mut vm = Vm::new(
                     vm_config,
                     exit_evt,
@@ -2137,6 +2186,8 @@ impl Vmm {
                     memory_file_path,
                     Some(prefault),
                     Some(memory_restore_mode),
+                    precreated_vm,
+                    prepared_workers,
                 )?;
 
                 if self
@@ -2566,9 +2617,10 @@ impl RequestHandler for Vmm {
                         .try_clone()
                         .map_err(VmError::EventFdClone)?;
 
-                    if let Some(ref vm_config) = self.vm_config {
+                    if let Some(vm_config) = self.vm_config.clone() {
+                        let (precreated_vm, prepared_workers) = self.take_preparation(&vm_config);
                         let mut vm = Vm::new(
-                            Arc::clone(vm_config),
+                            vm_config,
                             exit_evt,
                             reset_evt,
                             guest_exit_evt,
@@ -2585,6 +2637,8 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            precreated_vm,
+                            prepared_workers,
                         )?;
 
                         let r = vm.boot();
@@ -2770,6 +2824,9 @@ impl RequestHandler for Vmm {
         let r = vm.shutdown();
 
         if r.is_ok() {
+            // The VM owned the worker pool; drop the VMM's handle so a later
+            // vmm.prepare is not blocked by a stale remaining count.
+            self.preparation = Preparation::default();
             event!("vm", "shutdown");
         }
 
@@ -2792,6 +2849,10 @@ impl RequestHandler for Vmm {
         // vm.shutdown() closes all the console devices, so set console_info to None
         // so that the closed FD #s are not reused.
         let _ = self.console_info.take();
+
+        // The rebooted VM gets a fresh worker pool; drop the VMM's handle to
+        // the old one so the remaining count does not leak across reboots.
+        self.preparation = Preparation::default();
 
         let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
         let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
@@ -2838,6 +2899,8 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            None,
+            Default::default(),
         )?;
 
         // And we boot it
@@ -2915,10 +2978,61 @@ impl RequestHandler for Vmm {
             version,
             pid: process::id() as i64,
             features: feature_list(),
+            prepare: prepare_list(self.hypervisor.as_ref()),
         }
     }
 
+    fn vmm_prepare(&mut self, config: PrepareConfig) -> result::Result<Vec<u8>, VmError> {
+        if self.vm_config.is_some() || !matches!(self.vm, VmOwnership::None) {
+            return Err(VmError::Prepare(anyhow!("VMM is not idle")));
+        }
+        if !Preparation::supported(self.hypervisor.as_ref()) {
+            return Err(VmError::Prepare(anyhow!(
+                "Backend does not support preparation"
+            )));
+        }
+        config.validate().map_err(VmError::Prepare)?;
+
+        // Already prepared → reject. The caller must vm.delete first to
+        // re-prepare with a different config.
+        if !self.preparation.is_empty() {
+            return Err(VmError::Prepare(anyhow!(
+                "VMM is already prepared; use vm.delete to re-prepare"
+            )));
+        }
+
+        let response = PrepareResponse {
+            pre_vm: config.pre_vm,
+            pre_threads: config.pre_threads,
+        };
+
+        let vm = if config.pre_vm {
+            Some(Vm::create_hypervisor_vm(
+                self.hypervisor.as_ref(),
+                hypervisor::HypervisorVmConfig::default(),
+            )?)
+        } else {
+            None
+        };
+
+        self.preparation = Preparation::new(vm, config.pre_threads as usize)
+            .map_err(|e| VmError::Prepare(e.into()))?;
+
+        serde_json::to_vec(&response).map_err(|e| VmError::Prepare(e.into()))
+    }
+
+    fn vmm_query_prepare(&self) -> result::Result<Vec<u8>, VmError> {
+        // The worker pool handle is retained after the VM takes over, so this
+        // reports the live remaining count, not just the initial reservation.
+        let response = PrepareResponse {
+            pre_vm: self.preparation.vm.is_some(),
+            pre_threads: self.preparation.worker_count() as u32,
+        };
+        serde_json::to_vec(&response).map_err(|e| VmError::Prepare(e.into()))
+    }
+
     fn vm_delete(&mut self) -> result::Result<(), VmError> {
+        self.preparation = Preparation::default();
         if self.vm_config.is_none() {
             return Ok(());
         }
@@ -3374,6 +3488,12 @@ impl RequestHandler for Vmm {
                 )));
             }
             VmOwnership::None => {}
+        }
+
+        if !self.preparation.is_empty() {
+            return Err(MigratableError::MigrateReceive(anyhow!(
+                "Delete idle preparation before receiving migration"
+            )));
         }
 
         receive_data_migration

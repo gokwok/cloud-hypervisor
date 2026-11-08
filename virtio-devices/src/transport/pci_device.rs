@@ -37,6 +37,7 @@ use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::pci_common_config::VirtioPciCommonConfigState;
+use crate::thread_helper::{PreparedDeviceWorkerPool, with_prepared_workers};
 use crate::transport::{VIRTIO_PCI_COMMON_CONFIG_ID, VirtioPciCommonConfig, VirtioTransport};
 use crate::{
     ActivateResult, ActivationContext, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER, DEVICE_DRIVER_OK,
@@ -327,15 +328,20 @@ pub struct VirtioPciDeviceActivator {
     barrier: Option<Arc<Barrier>>,
     id: String,
     status: Arc<AtomicU8>,
+    prepared_workers: PreparedDeviceWorkerPool,
 }
 
 impl VirtioPciDeviceActivator {
     pub fn activate(mut self) -> ActivateResult {
-        let result = self.device.lock().unwrap().activate(ActivationContext {
+        let context = ActivationContext {
             mem: self.memory.take().unwrap(),
             interrupt_cb: Arc::clone(&self.interrupt),
             queues: self.queues.take().unwrap(),
             device_status: Arc::clone(&self.status),
+        };
+        let device = Arc::clone(&self.device);
+        let result = with_prepared_workers(&self.prepared_workers, || {
+            device.lock().unwrap().activate(context)
         });
 
         if let Err(e) = &result {
@@ -420,6 +426,10 @@ pub struct VirtioPciDevice {
     // Pending activations
     pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
 
+    // Pre-created worker threads for device activation; an empty pool
+    // activates devices the same way as no pool.
+    prepared_workers: PreparedDeviceWorkerPool,
+
     bdf: PciBdf,
 }
 
@@ -438,6 +448,7 @@ impl VirtioPciDevice {
         dma_handler: Option<Arc<dyn ExternalDmaMapping>>,
         pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
         snapshot: Option<&Snapshot>,
+        prepared_workers: PreparedDeviceWorkerPool,
     ) -> Result<Self> {
         let mut locked_device = device.lock().unwrap();
         let mut queue_evts = Vec::new();
@@ -643,6 +654,7 @@ impl VirtioPciDevice {
             activate_evt,
             dma_handler,
             pending_activations,
+            prepared_workers,
             bdf,
         };
 
@@ -851,6 +863,7 @@ impl VirtioPciDevice {
             barrier,
             id: self.id.clone(),
             status: Arc::clone(&self.common_config.driver_status),
+            prepared_workers: Arc::clone(&self.prepared_workers),
         }
     }
 
@@ -1634,6 +1647,7 @@ mod tests {
             barrier: Some(Arc::clone(&barrier)),
             id: "test-dev".to_string(),
             status: Arc::clone(&status),
+            prepared_workers: PreparedDeviceWorkerPool::default(),
         };
         (activator, status, device_activated, interrupt, barrier)
     }
@@ -1723,6 +1737,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(Vec::new())),
             None,
+            PreparedDeviceWorkerPool::default(),
         )
         .unwrap()
     }
@@ -1804,6 +1819,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(Vec::new())),
             None,
+            PreparedDeviceWorkerPool::default(),
         )
         .unwrap()
     }

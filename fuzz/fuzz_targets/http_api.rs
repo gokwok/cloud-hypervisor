@@ -18,6 +18,7 @@ use vmm::api::{
     VmSendMigrationData, VmmPingResponse,
 };
 use vmm::config::RestoreConfig;
+use vmm::prepare::PrepareConfig;
 use vmm::vm::{Error as VmError, VmState};
 use vmm::vm_config::*;
 use vmm::{EpollContext, EpollDispatch};
@@ -236,7 +237,16 @@ impl RequestHandler for StubApiRequestHandler {
             version: String::new(),
             pid: 0,
             features: Vec::new(),
+            prepare: Vec::new(),
         }
+    }
+
+    fn vmm_prepare(&mut self, _config: PrepareConfig) -> Result<Vec<u8>, VmError> {
+        Ok(Vec::new())
+    }
+
+    fn vmm_query_prepare(&self) -> Result<Vec<u8>, VmError> {
+        Ok(Vec::new())
     }
 
     fn vm_delete(&mut self) -> Result<(), VmError> {
