@@ -311,7 +311,7 @@ Cloud Hypervisor supports hotplug of CPUs, passthrough devices (VFIO),
 ## Device Model
 
 Details of the device model can be found in this
-[documentation](docs/device_model.md).
+[Cloud Hypervisor device model documentation](docs/device_model.md).
 
 ## Roadmap
 
